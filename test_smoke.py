@@ -125,6 +125,31 @@ def test_search():
     return r
 
 
+def test_live_stream_guard():
+    """get_video_frames must reject a live broadcast in ~seconds, not attempt to
+    download an open-ended stream (confirmed real 2026-08-08: that took ~90s and
+    ended in an unhelpful bare 'ffmpeg exited with code 1'). Uses whatever is
+    actually live on a channel that's reliably streaming 24/7, rather than a
+    hardcoded video ID, since a specific stream's ID doesn't stay live forever.
+    """
+    import time
+    live = server.list_channel_videos("https://www.youtube.com/@LofiGirl/streams", max_results=1)
+    if not live["videos"]:
+        print("      no live video listed right now - skipping (not a failure, just nothing to test against)")
+        return True
+    vid = live["videos"][0]["video_id"]
+    t0 = time.time()
+    try:
+        server.get_video_frames(vid, timestamps=["0:05"])
+        raise AssertionError(f"{vid} is listed live but get_video_frames did not reject it")
+    except RuntimeError as e:
+        elapsed = time.time() - t0
+        assert "live" in str(e).lower(), f"wrong rejection reason: {e}"
+        assert elapsed < 15, f"live-stream guard took {elapsed:.1f}s - should fail in ~1-2s, not attempt a download"
+        print(f"      rejected {vid} as live in {elapsed:.1f}s: {str(e)[:100]}")
+    return True
+
+
 if __name__ == "__main__":
     check("url parsers", test_url_parsers)
     listings = [check(f"list_channel_videos {c}", lambda c=c: test_list(c)) for c in CHANNELS]
@@ -133,6 +158,7 @@ if __name__ == "__main__":
         check(f"get_video_transcript {first}", lambda: test_transcript(first))
         check(f"get_video_frames {first}", lambda: test_frames(first))
     check("search_youtube", test_search)
+    check("live stream guard", test_live_stream_guard)
 
     print()
     if failures:

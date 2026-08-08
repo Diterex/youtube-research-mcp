@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -27,7 +28,8 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
-from yt_dlp.utils import DownloadError, ExtractorError
+from yt_dlp.cookies import CookieLoadError
+from yt_dlp.utils import YoutubeDLError
 
 # Works on both major versions of the `mcp` package: 2.x renamed the server
 # class (FastMCP -> MCPServer). Nothing else this server uses changed.
@@ -96,11 +98,39 @@ def _extract(url: str, **extra: Any) -> dict:
 def _friendly_error(url: str, err: Optional[BaseException]) -> str:
     text = str(err) if err else ""
     low = text.lower()
+    # Checked by type, not text: CookieLoadError's own message is just "failed to
+    # load cookies" - the useful detail (e.g. "could not copy Chrome cookie
+    # database") only ever reaches yt-dlp's logger, never the exception itself.
+    if isinstance(err, CookieLoadError) or "could not copy" in low and "cookie" in low:
+        return (
+            f"Could not read cookies for {url}: the browser named in "
+            "YT_DLP_COOKIES_FROM_BROWSER is currently running and holds an exclusive "
+            "lock on its own cookie database (confirmed on Windows: this fails while "
+            "Chrome is open, works once it's closed). Close that browser and retry, "
+            "point YT_DLP_COOKIES_FROM_BROWSER at a browser that's currently closed, "
+            "or switch to YT_DLP_COOKIEFILE with an exported cookies.txt instead - "
+            "that path doesn't depend on any browser's run state."
+        )
     if "sign in to confirm" in low or "bot" in low and "confirm" in low:
         return (
             f"YouTube asked this machine to sign in before serving {url}. Set the "
-            "env var YT_DLP_COOKIES_FROM_BROWSER=chrome (or firefox/edge) on the MCP "
-            "server registration and retry."
+            "env var YT_DLP_COOKIES_FROM_BROWSER to a browser that is CURRENTLY CLOSED "
+            "(the browser-cookie path fails outright while that browser is running - "
+            "see the README) or set YT_DLP_COOKIEFILE to an exported cookies.txt, "
+            "which works regardless of what's open, then retry."
+        )
+    # yt-dlp has no fixed geo-block string of its own - it relays whatever reason
+    # text YouTube's backend sends, which is reportedly phrasings like "not
+    # available in your country" / "not made this video available in your
+    # country". Never actually triggered in testing (checked 2026-08-08: a
+    # documented geo-block test video is now blocked everywhere by copyright
+    # claim instead, and BBC's YouTube channel turned out not to be region-locked
+    # the way BBC iPlayer is) - this branch is a best-effort match on the
+    # reported wording, unverified against a real occurrence.
+    if "country" in low and ("not available" in low or "not made" in low):
+        return (
+            f"{url} is blocked in this server's region. There is no cookie or retry "
+            "fix for this - it needs a video available where this machine is."
         )
     if "private" in low:
         return f"{url} is private - no listing or captions are available."
@@ -108,12 +138,32 @@ def _friendly_error(url: str, err: Optional[BaseException]) -> str:
         return f"{url} is unavailable or has been removed."
     if "does not exist" in low or "not found" in low or "404" in low:
         return f"No such channel/video: {url}. Check the handle or video ID."
+    if "live stream" in low or "live broadcast" in low:
+        return f"{url} is a live broadcast - see the live-stream note above."
     if text:
         return f"yt-dlp could not read {url}: {text.strip()}"
     return (
         f"yt-dlp returned nothing for {url}. If this is a channel, confirm the handle "
         "is spelled right; if a video, confirm it is public."
     )
+
+
+_PERMANENT_FAILURE_MARKERS = (
+    "could not copy", "cookie", "sign in to confirm", "country", "private",
+    "unavailable", "removed", "does not exist", "not found", "404",
+    "live stream", "live broadcast",
+)
+
+
+def _is_permanent_failure(text: str) -> bool:
+    """True if retrying this exact error could never help - only worth checking
+    before a retry loop, never a substitute for _friendly_error's actual message.
+    A generic HTTP failure (403/5xx/timeout) is presumed transient and IS retried:
+    confirmed real 2026-08-08 on a 4-hour video's stream fetch, which 403'd once
+    then succeeded seconds later with nothing else changed.
+    """
+    low = text.lower()
+    return any(m in low for m in _PERMANENT_FAILURE_MARKERS)
 
 
 # --------------------------------------------------------------------------
@@ -482,6 +532,23 @@ def _local_stream(video_id: str, max_height: int) -> tuple[str, dict]:
         return cached, (info or {})
 
     url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # Check live status BEFORE downloading. A currently-live or not-yet-started
+    # broadcast has no end, so "download the stream" never finishes cleanly -
+    # confirmed live 2026-08-08: it ran ~90s then ffmpeg exited with a bare
+    # "code 1" that gives no hint why. Fail in ~1s with a real reason instead.
+    try:
+        probe = _extract(url, extract_flat=False)
+    except YoutubeDLError as e:
+        raise RuntimeError(_friendly_error(url, e)) from e
+    if probe.get("is_live") or probe.get("live_status") in ("is_live", "is_upcoming"):
+        raise RuntimeError(
+            f"{url} ('{probe.get('title')}') is a live broadcast with no fixed "
+            "end, so there is no finite stream to fetch frames from. If it has "
+            "since ended, wait for YouTube to publish the VOD replay and retry - "
+            "a 'was_live' video works normally."
+        )
+
     out = os.path.join(_cache_dir(), f"{video_id}-{max_height}.%(ext)s")
     opts = _ydl_opts(
         skip_download=False,
@@ -491,11 +558,28 @@ def _local_stream(video_id: str, max_height: int) -> tuple[str, dict]:
                 f"/bestvideo[height<=?{max_height}]"
                 f"/best[height<=?{max_height}]/best"),
     )
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except (DownloadError, ExtractorError) as e:
-        raise RuntimeError(_friendly_error(url, e)) from e
+    # Retries the WHOLE extraction, not just the byte-level fetch: confirmed
+    # 2026-08-08 that yt-dlp's own extractor_retries doesn't cover this, because a
+    # signed download URL can 403 in a way that only clears on a fresh extraction
+    # (which re-signs it) - a bare retry of the same signed URL wouldn't have
+    # helped. Real, reproduced case: a 4-hour video's stream 403'd once, then
+    # succeeded seconds later with zero other changes. Skipped entirely for
+    # failures no retry could ever fix (bot-wall, cookie lock, live stream,
+    # private/unavailable, region-block) so those still fail in ~1 attempt, not 3.
+    last_err: Optional[YoutubeDLError] = None
+    for attempt in range(3):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            last_err = None
+            break
+        except YoutubeDLError as e:
+            last_err = e
+            if _is_permanent_failure(str(e)) or attempt == 2:
+                break
+            time.sleep(2 * (attempt + 1))
+    if last_err is not None:
+        raise RuntimeError(_friendly_error(url, last_err)) from last_err
     if not info:
         raise RuntimeError(_friendly_error(url, None))
 
@@ -603,7 +687,7 @@ def list_channel_videos(
 
     try:
         info = _extract(url, extract_flat="in_playlist", playlistend=max_results, ignoreerrors=True)
-    except (DownloadError, ExtractorError) as e:
+    except YoutubeDLError as e:
         raise RuntimeError(_friendly_error(url, e)) from e
 
     entries = [e for e in (info.get("entries") or []) if e]
@@ -687,7 +771,7 @@ def get_video_transcript(
     url = f"https://www.youtube.com/watch?v={vid}"
     try:
         info = _extract(url, extract_flat=False, writesubtitles=True, writeautomaticsub=True)
-    except (DownloadError, ExtractorError) as e:
+    except YoutubeDLError as e:
         raise RuntimeError(_friendly_error(url, e)) from e
 
     track, kind, code = _pick_track(info, language)
@@ -768,7 +852,7 @@ def search_youtube(query: str, max_results: int = 20) -> dict:
 
     try:
         info = _extract(f"ytsearch{max_results}:{q}", extract_flat="in_playlist")
-    except (DownloadError, ExtractorError) as e:
+    except YoutubeDLError as e:
         raise RuntimeError(_friendly_error(f"search '{q}'", e)) from e
 
     videos = []

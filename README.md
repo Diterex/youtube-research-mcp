@@ -140,9 +140,21 @@ Or add it by hand to `~/.claude.json`:
 .\.venv\Scripts\python.exe test_smoke.py
 ```
 
-This hits YouTube for real, with no mocking. It lists two real channels, pulls a real
-transcript, runs a search, and checks every URL shape the parsers are supposed to
-handle. It prints a PASS or FAIL line per check and exits non zero if anything fails.
+This hits YouTube for real, with no mocking, deliberately - every real failure mode
+found and fixed in this project (the cookie-database lock, the live-stream hang, the
+transient 403 on a large fetch) only showed up by testing against the real service; a
+mocked suite would have asserted the code does what it was written to do, not caught
+where that turned out to be wrong. It lists two real channels, pulls a real transcript,
+runs a search, checks every URL shape the parsers are supposed to handle, and rejects
+whatever's currently live on a 24/7 stream in a couple of seconds rather than
+attempting to download it. Prints a PASS or FAIL line per check, exits non zero if
+anything fails.
+
+The real cost of that choice: every run needs network access and YouTube being up,
+and there's no fast offline loop for iterating on unrelated code. Accepted deliberately
+rather than fixed - an offline/mocked layer wouldn't have caught anything this pass
+found, and network-dependent tests are the right shape for a tool whose entire job is
+talking to a real external service.
 
 ## Notes and limits
 
@@ -161,14 +173,29 @@ auto generated one. The server says so explicitly rather than returning an empty
 string, so there is no point retrying those.
 
 **If YouTube asks for a sign in.** YouTube sometimes demands a signed in session and
-yt-dlp will report "Sign in to confirm you're not a bot". The fix is to give it your
-browser cookies, using either of these environment variables on the server
-registration.
+yt-dlp will report "Sign in to confirm you're not a bot". Tested against 90 real,
+distinct videos at meaningful concurrency (10 parallel workers) on 2026-08-08 without
+ever triggering it - yt-dlp calls YouTube's internal API with client emulation rather
+than scraping the rendered page, which is a different code path from what the casual
+"browser automation" bot-check usually catches. So the trigger itself is unverified
+here; what *is* verified is the fix and a real failure mode in it.
 
 ```
-YT_DLP_COOKIES_FROM_BROWSER=chrome    # or firefox, edge
+YT_DLP_COOKIES_FROM_BROWSER=chrome    # or firefox, edge - see the caveat below
 YT_DLP_COOKIEFILE=C:\path\to\cookies.txt
 ```
+
+**`YT_DLP_COOKIES_FROM_BROWSER` fails outright while that browser is running**,
+confirmed on this machine: with Chrome open, yt-dlp cannot copy its cookie database
+(`PermissionError`, since Chrome holds an exclusive lock on it) and the read fails
+completely - not silently, it raises `CookieLoadError`. Pointing at a browser that
+happens to be closed (`edge`, when Edge wasn't running) worked cleanly. Since Chrome
+being open is the normal case, not an edge case, **`YT_DLP_COOKIEFILE` is the more
+reliable choice** - export cookies.txt with a browser extension once, and it works
+regardless of what's running. The server now recognizes this specific failure
+(`_friendly_error`'s `CookieLoadError` branch) and returns an actionable message
+telling you to close the browser or switch to `YT_DLP_COOKIEFILE`, instead of
+crashing with a raw Python traceback the way it did before this was found and fixed.
 
 **Why frames are fetched rather than seeked.** The obvious design is to have ffmpeg
 seek the remote stream URL and range request only the bytes it needs. That does not
@@ -188,6 +215,42 @@ cold.
 
 **ffmpeg is required for frames only.** The other three tools do not need it. If it is
 missing, `get_video_frames` says so and tells you to run `winget install Gyan.FFmpeg`.
+
+**Live streams are rejected before any fetch is attempted.** A currently-live or
+not-yet-started broadcast has no end, so "download the stream" never finishes -
+confirmed real 2026-08-08 against Lofi Girl's 24/7 stream: it ran for about 90 seconds
+before ffmpeg exited with a bare, unhelpful `code 1`. `get_video_frames` now checks
+`is_live`/`live_status` first and fails in about 1-2 seconds with a clear reason
+instead. A `was_live` video (the broadcast has ended and YouTube published the
+replay) works normally - only genuinely open-ended streams are rejected.
+
+**Playlist URLs work end to end**, confirmed against a real 11-video playlist -
+listing, ordering, and channel/count metadata all correct. Their videos follow the
+same upload-date rule as any other listing (recent ones resolve free via RSS, older
+ones need `resolve_all_dates=True`) - there's nothing playlist-specific about it, an
+older video is an older video whether reached by channel or by playlist.
+
+**Region-blocked videos: the fallback path is proven, the specific message is not.**
+Two real attempts to trigger an actual geo-block both missed: a video documented in
+yt-dlp's own issue tracker as geo-restricted is now blocked everywhere by a copyright
+claim instead, and BBC's YouTube channel turned out not to be region-locked the way
+BBC iPlayer is. What *is* proven is that the general failure path handles it safely -
+any `YoutubeDLError` yt-dlp raises comes back as a clean message, never a crash - and
+`_friendly_error` has a specific branch for YouTube's documented "not available in
+your country" phrasing, matched by text since yt-dlp has no dedicated exception type
+for this. That specific branch is unverified against a real occurrence.
+
+**Transient failures on the frame-fetch path are retried automatically.** Only the
+large-stream download in `get_video_frames` does a real content fetch (the other three
+tools are lightweight metadata/caption calls, and 90 of those in a row - including a
+10-worker concurrent burst - produced zero failures). Confirmed real on 2026-08-08: a
+4-hour video's stream fetch returned HTTP 403 once, then succeeded seconds later with
+nothing else changed - a signed download URL failing in a way only a fresh extraction
+clears, not something yt-dlp's own `extractor_retries` covers, since that only retries
+metadata calls. `_local_stream` now retries the whole extraction (not just the byte
+fetch) up to 3 times with backoff - but skips retrying entirely for failures no retry
+could fix (cookie lock, live stream, private/unavailable, region-block), so those
+still fail in one attempt, not three.
 
 **Keeping yt-dlp current.** YouTube changes its internals regularly and yt-dlp keeps
 up, so if extractions start failing the first thing to try is an upgrade.
@@ -209,3 +272,21 @@ A real MCP stdio session completed a handshake, listed all four tools, returned 
 listing data, and returned mixed text plus image content from `get_video_frames`. All
 four of its error paths (bad timestamp, no timestamp given, timestamp past the end of
 the video, unavailable video) return proper MCP errors with actionable messages.
+
+**Hardening pass, 2026-08-08.** Four rough edges from the first verification round,
+worked through against real content, not synthetic tests - see "Notes and limits"
+above for the full detail on each:
+
+| Area | Result |
+|---|---|
+| Playlist URLs | Confirmed working end to end against a real 11-video playlist |
+| Bot-wall trigger | Not reproduced (90 real requests, 10-way concurrent) - the cookie *fix* was tested instead, and found broken while the named browser is running; fixed |
+| Live streams | Real hang found (90s, unhelpful error) and fixed (rejected in ~1-2s) |
+| Region-locked videos | Not reproduced (2 real attempts) - general failure handling proven safe regardless; the specific message is unverified |
+| Multi-hour videos | Confirmed against a 23-hour transcript and a 4-hour frame fetch (including a frame at the 4:00:00 mark) |
+| Retry/backoff | Added for the one path proven to need it (large-stream fetch, real transient 403 reproduced and fixed) - not added to the metadata/caption paths, which showed zero failures across 90 real requests |
+
+One bug found *while fixing another*: the live-stream check itself could crash
+unhandled in the same cookie-lock scenario, because it was a bare call with no
+`except`. Caught by testing the fix against the earlier finding, not by inspection -
+fixed in the same pass.
