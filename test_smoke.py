@@ -88,6 +88,35 @@ def test_transcript(video_id):
     return r
 
 
+def test_frames(video_id):
+    import time
+    t0 = time.time()
+    out = server.get_video_frames(video_id, timestamps=["1:00", "2:00"], width=1280)
+    cold = time.time() - t0
+    summary, images = out[0], out[1:]
+    assert len(images) == 2, f"expected 2 frames, got {len(images)}"
+    assert all(len(i.data) > 5000 for i in images), "a frame came back suspiciously small"
+    assert all(i.data[:2] == b"\xff\xd8" for i in images), "not a JPEG"
+    print(f"      {summary.splitlines()[0][:78]}")
+    print(f"      cold {cold:.1f}s, sizes {[len(i.data)//1024 for i in images]} KB")
+
+    t1 = time.time()
+    server.get_video_frames(video_id, timestamps=["3:00"])
+    warm = time.time() - t1
+    assert warm < cold, f"cache did not help (cold {cold:.1f}s, warm {warm:.1f}s)"
+    print(f"      warm {warm:.1f}s (stream cache working)")
+
+    for bad, why in [({"timestamps": ["banana"]}, "bad timestamp"),
+                     ({}, "no timestamps given"),
+                     ({"timestamps": ["99:00:00"]}, "past end of video")]:
+        try:
+            server.get_video_frames(video_id, **bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{why} should have raised ValueError")
+    return True
+
+
 def test_search():
     r = server.search_youtube("FreeCAD assembly workbench tutorial", max_results=3)
     assert r["count"] >= 1
@@ -102,6 +131,7 @@ if __name__ == "__main__":
     first = next((l["videos"][0]["video_id"] for l in listings if l), None)
     if first:
         check(f"get_video_transcript {first}", lambda: test_transcript(first))
+        check(f"get_video_frames {first}", lambda: test_frames(first))
     check("search_youtube", test_search)
 
     print()

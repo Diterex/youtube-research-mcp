@@ -13,9 +13,15 @@ caption track URL fetched straight into memory.
 
 from __future__ import annotations
 
+import atexit
+import glob
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
@@ -26,9 +32,9 @@ from yt_dlp.utils import DownloadError, ExtractorError
 # Works on both major versions of the `mcp` package: 2.x renamed the server
 # class (FastMCP -> MCPServer). Nothing else this server uses changed.
 try:  # mcp >= 2.0
-    from mcp.server.mcpserver import MCPServer as FastMCP
+    from mcp.server.mcpserver import Image, MCPServer as FastMCP
 except ImportError:  # mcp 1.x
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP, Image
 
 mcp = FastMCP("youtube-research")
 
@@ -387,6 +393,152 @@ def _to_blocks(lines: list[tuple[float, str]], block_seconds: int, timestamps: b
 
 
 # --------------------------------------------------------------------------
+# Frame grabbing
+# --------------------------------------------------------------------------
+
+def _parse_timestamp(value: Any) -> float:
+    """Accept 754, '754', '12:34' or '1:23:45' and return seconds."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if not s:
+        raise ValueError("Empty timestamp.")
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) > 3:
+            raise ValueError(f"'{s}' is not a timestamp. Use S, M:SS or H:MM:SS.")
+        try:
+            nums = [float(p) for p in parts]
+        except ValueError:
+            raise ValueError(f"'{s}' is not a timestamp. Use S, M:SS or H:MM:SS.") from None
+        total = 0.0
+        for n in nums:
+            total = total * 60 + n
+        return total
+    try:
+        return float(s)
+    except ValueError:
+        raise ValueError(f"'{s}' is not a timestamp. Use S, M:SS or H:MM:SS.") from None
+
+
+def _ffmpeg() -> str:
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        raise RuntimeError(
+            "ffmpeg is not on PATH, and frame grabbing needs it. Install it with "
+            "'winget install Gyan.FFmpeg' and restart the MCP server."
+        )
+    return exe
+
+
+# Fetched video-only streams, keyed by (video_id, max_height). Kept for the life
+# of the server process so repeated calls on the same video are instant, capped
+# so a long research session cannot fill the disk.
+_STREAM_CACHE: "OrderedDict[tuple[str, int], str]" = OrderedDict()
+_CACHE_LIMIT = 3
+_CACHE_DIR: Optional[str] = None
+
+
+def _cache_dir() -> str:
+    global _CACHE_DIR
+    if _CACHE_DIR is None:
+        _CACHE_DIR = tempfile.mkdtemp(prefix="yt-research-frames-")
+        atexit.register(shutil.rmtree, _CACHE_DIR, True)
+    return _CACHE_DIR
+
+
+def _evict(key: Optional[tuple[str, int]] = None) -> None:
+    victim = key if key is not None else next(iter(_STREAM_CACHE))
+    path = _STREAM_CACHE.pop(victim, None)
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _local_stream(video_id: str, max_height: int) -> tuple[str, dict]:
+    """Fetch the video-only stream to a temp file and return (path, info).
+
+    Why a fetch rather than seeking the remote URL: YouTube binds a stream URL to
+    the player client that requested it, and refuses or throttles anyone else -
+    handing the URL to ffmpeg gets a 403 or a stall, and yt-dlp's own
+    download_ranges hits the same wall because it shells out to ffmpeg too.
+    yt-dlp fetching the whole stream itself works because it holds the matching
+    client session.
+
+    This is cheap in practice. The stream is video-only (audio is a separate
+    track we never ask for), so a 31 minute 720p tutorial is about 32 MB and
+    lands in under 10 seconds. Frames then come off the local file instantly.
+    The file is deleted when the server exits.
+    """
+    key = (video_id, max_height)
+    cached = _STREAM_CACHE.get(key)
+    if cached and os.path.exists(cached):
+        _STREAM_CACHE.move_to_end(key)
+        with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}",
+                                    download=False, process=False)
+        return cached, (info or {})
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    out = os.path.join(_cache_dir(), f"{video_id}-{max_height}.%(ext)s")
+    opts = _ydl_opts(
+        skip_download=False,
+        outtmpl=out,
+        # Video-only first: it is a fraction of the size and we never need audio.
+        format=(f"bestvideo[height<=?{max_height}][ext=mp4]"
+                f"/bestvideo[height<=?{max_height}]"
+                f"/best[height<=?{max_height}]/best"),
+    )
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except (DownloadError, ExtractorError) as e:
+        raise RuntimeError(_friendly_error(url, e)) from e
+    if not info:
+        raise RuntimeError(_friendly_error(url, None))
+
+    path = info.get("requested_downloads", [{}])[0].get("filepath")
+    if not path or not os.path.exists(path):
+        matches = glob.glob(os.path.join(_cache_dir(), f"{video_id}-{max_height}.*"))
+        if not matches:
+            raise RuntimeError(
+                f"yt-dlp reported success for {url} but produced no file. If this "
+                "video is a live stream or members-only, frames are not available."
+            )
+        path = matches[0]
+
+    while len(_STREAM_CACHE) >= _CACHE_LIMIT:
+        _evict()
+    _STREAM_CACHE[key] = path
+    return path, info
+
+
+def _grab_frame(args: tuple[str, float, int, int]) -> tuple[float, Optional[bytes], Optional[str]]:
+    """Pull one JPEG at one timestamp off the local file."""
+    path, seconds, width, quality = args
+    cmd = [
+        _ffmpeg(), "-nostdin", "-loglevel", "error",
+        "-ss", f"{seconds:.3f}",   # seek before -i: instant on a local file
+        "-i", path,
+        "-frames:v", "1",
+        "-vf", f"scale={width}:-2:flags=lanczos",
+        "-q:v", str(quality),
+        "-f", "image2", "-vcodec", "mjpeg",
+        "-",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return seconds, None, "ffmpeg timed out after 60s"
+    if proc.returncode != 0 or not proc.stdout:
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        return seconds, None, (err[-1] if err else "ffmpeg produced no frame")
+    return seconds, proc.stdout, None
+
+
+# --------------------------------------------------------------------------
 # Tools
 # --------------------------------------------------------------------------
 
@@ -629,6 +781,142 @@ def search_youtube(query: str, max_results: int = 20) -> dict:
         videos.append(v)
 
     return {"query": q, "count": len(videos), "videos": videos}
+
+
+@mcp.tool(
+    name="get_video_frames",
+    annotations={
+        "title": "Grab video frames at chosen moments",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def get_video_frames(
+    video_url_or_id: str,
+    timestamps: Optional[list[str]] = None,
+    every_seconds: int = 0,
+    max_frames: int = 6,
+    width: int = 1280,
+    max_height: int = 720,
+    quality: int = 4,
+) -> list:
+    """See what a video actually shows at chosen moments. Returns real images.
+
+    Transcripts cannot capture a screen-based tutorial. "Click this, then drag it
+    here" has no referent in text, toolbar clicks are usually silent, typed
+    dialog values are rarely spoken, and auto-captions mangle exactly the
+    technical terms you need. Use this to look at the moments that matter.
+
+    The intended workflow is two steps, and doing it in this order is what keeps
+    it cheap:
+      1. get_video_transcript(..., include_timestamps=True) to find WHICH moments
+         matter, across as many videos as you like.
+      2. get_video_frames(video_id, timestamps=[...]) on just those moments.
+
+    The video-only stream is fetched to a temp file first, then every frame comes
+    off it locally. That sounds expensive and is not: video-only means no audio
+    track, so a 31 minute 720p tutorial is about 32 MB and lands in under 10
+    seconds, and further calls on the same video are instant because the file is
+    kept for the life of the server process (3 videos max, deleted on exit).
+    Asking for many timestamps in ONE call is therefore much cheaper than many
+    calls, and vastly cheaper than one call per frame on different videos.
+
+    Args:
+        video_url_or_id: An 11-character video ID or any YouTube video URL.
+        timestamps: The moments to capture, as 'S', 'M:SS' or 'H:MM:SS' strings
+            (e.g. ["4:12", "11:38", "1:02:05"]). Take these from a timestamped
+            transcript.
+        every_seconds: Instead of explicit timestamps, sample evenly this many
+            seconds apart. Use only when surveying an unfamiliar video; explicit
+            timestamps are far cheaper. Ignored if timestamps is given.
+        max_frames: Hard cap on frames returned (1-20, default 6). Every frame
+            costs context, so keep this tight.
+        width: Output width in pixels (320-1920, default 1280). Do not go below
+            about 960 if you need to read menu labels or dialog values.
+        max_height: Source stream height to fetch (default 720, which is enough
+            to read a CAD toolbar and keeps the fetch small). Raise to 1080 only
+            if 720 proves too coarse.
+        quality: JPEG quality, 2 is best and 31 is worst (default 4).
+
+    Returns:
+        A list whose first item is a text summary (video title, duration, and the
+        timestamp of each frame in order), followed by one image per timestamp.
+        Frames that could not be captured are reported in the summary text rather
+        than failing the whole call.
+
+    Errors:
+        Raises ValueError for bad arguments or unparseable timestamps, and
+        RuntimeError if ffmpeg is missing or the video has no playable stream.
+    """
+    vid = _video_id(video_url_or_id)
+    if not 1 <= max_frames <= 20:
+        raise ValueError("max_frames must be between 1 and 20.")
+    if not 320 <= width <= 1920:
+        raise ValueError("width must be between 320 and 1920.")
+    if not 2 <= quality <= 31:
+        raise ValueError("quality must be between 2 (best) and 31 (worst).")
+    if not 144 <= max_height <= 2160:
+        raise ValueError("max_height must be between 144 and 2160.")
+    if not timestamps and every_seconds <= 0:
+        raise ValueError(
+            "Give either timestamps=['4:12', ...] or every_seconds=N. Prefer "
+            "timestamps taken from a timestamped transcript - it is much cheaper."
+        )
+    _ffmpeg()  # fail fast with an install hint rather than after the fetch
+
+    path, info = _local_stream(vid, max_height)
+    duration = info.get("duration")
+
+    if timestamps:
+        wanted = [_parse_timestamp(t) for t in timestamps]
+    else:
+        if not duration:
+            raise ValueError(
+                "This video reports no duration, so it cannot be sampled evenly. "
+                "Pass explicit timestamps instead."
+            )
+        wanted = [float(s) for s in range(0, int(duration), every_seconds)]
+
+    if duration:
+        over = [t for t in wanted if t > duration]
+        wanted = [t for t in wanted if t <= duration]
+        if not wanted:
+            raise ValueError(
+                f"Every requested timestamp is past the end of the video "
+                f"({_hms(duration)} long)."
+            )
+    else:
+        over = []
+
+    dropped = max(0, len(wanted) - max_frames)
+    wanted = sorted(set(wanted))[:max_frames]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(
+            _grab_frame,
+            [(path, t, width, quality) for t in wanted],
+        ))
+
+    out: list = []
+    lines = [
+        f"{info.get('title')} [{_hms(duration)}] - frames from "
+        f"https://www.youtube.com/watch?v={vid}",
+    ]
+    for seconds, jpeg, err in results:
+        if jpeg:
+            lines.append(f"  [{_hms(seconds)}] captured ({len(jpeg) // 1024} KB)")
+            out.append(Image(data=jpeg, format="jpeg"))
+        else:
+            lines.append(f"  [{_hms(seconds)}] FAILED: {err}")
+    if dropped:
+        lines.append(f"  ({dropped} more timestamps dropped by max_frames={max_frames})")
+    if over:
+        lines.append(f"  ({len(over)} timestamps ignored as past the end of the video)")
+    lines.append("Frames are listed in the same order as the timestamps above.")
+
+    return ["\n".join(lines)] + out
 
 
 if __name__ == "__main__":
