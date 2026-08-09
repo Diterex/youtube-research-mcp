@@ -6,9 +6,12 @@ tools come back empty. This server goes through yt-dlp's extractors instead,
 which read YouTube's own internal JSON endpoints. No YouTube Data API key, no
 browser rendering, no scraping of rendered HTML.
 
-Everything here is read-only. Nothing is ever downloaded to disk - video
-listings come from a flat playlist extraction, and transcripts come from the
-caption track URL fetched straight into memory.
+Everything here is read-only: no channel is modified, no video is uploaded,
+nothing is posted anywhere. Disk use is minimal and deliberate - video listings
+and transcripts never touch disk (a flat playlist extraction and a caption track
+read straight into memory), and get_video_frames downloads only a small
+video-only stream to a temp file it deletes on exit, never the full video with
+audio.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
@@ -51,6 +55,21 @@ YT_NS = "{http://www.youtube.com/xml/schemas/2015}"
 
 # Channel tabs that are a list of videos. Anything else gets rewritten to /videos.
 VIDEO_TABS = ("videos", "shorts", "streams")
+
+# Hosts a full URL is allowed to point at. Anything else is rejected outright -
+# this server hands URLs to yt-dlp's extractor, which has a generic fallback
+# extractor capable of fetching arbitrary URLs (not just YouTube's own). Without
+# this check, a caller (including an LLM agent acting on untrusted content it
+# read elsewhere) could pass a non-YouTube URL - e.g. a playlist-shaped one
+# pointing at an internal host - and have this server make an outbound request
+# to it. Every code path that accepts a full URL must check this before doing
+# anything else with the URL.
+_ALLOWED_HOSTS = ("youtube.com", "youtu.be")
+
+
+def _is_youtube_host(netloc: str) -> bool:
+    host = netloc.split("@")[-1].split(":")[0].lower()  # strip userinfo/port
+    return any(host == h or host.endswith("." + h) for h in _ALLOWED_HOSTS)
 
 
 # --------------------------------------------------------------------------
@@ -191,6 +210,11 @@ def _channel_url(channel: str) -> str:
             return f"https://www.youtube.com/@{c}/videos"
 
     parsed = urlparse(c)
+    if not _is_youtube_host(parsed.netloc):
+        raise ValueError(
+            f"'{c}' does not point at youtube.com or youtu.be. Refusing to pass a "
+            "non-YouTube URL to the extractor."
+        )
     # Playlists have their own extractor - leave them exactly as given.
     if "list" in parse_qs(parsed.query) or parsed.path.startswith("/playlist"):
         return c
@@ -413,9 +437,30 @@ def _parse_timed_text(raw: str) -> list[tuple[float, str]]:
     return out
 
 
+def _fetch_url_bytes(url: str) -> bytes:
+    """GET a URL with the same retry-transient/skip-permanent policy as the
+    video-stream fetch. Caption track URLs are signed and time-limited the same
+    way stream URLs are (see _local_stream's docstring) - this closes a gap
+    where that class of failure was hardened for frames but not transcripts:
+    this call used to be a bare, unprotected urlopen, so any network hiccup
+    fetching the caption file crashed the whole tool call with a raw traceback
+    instead of a clean error.
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
+                return ydl.urlopen(url).read()
+        except Exception as e:  # noqa: BLE001 - urlopen can raise outside yt-dlp's own hierarchy
+            last_err = e
+            if _is_permanent_failure(str(e)) or attempt == 2:
+                break
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(_friendly_error(url, last_err)) from last_err
+
+
 def _fetch_caption_lines(track: dict) -> list[tuple[float, str]]:
-    with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
-        raw = ydl.urlopen(track["url"]).read()
+    raw = _fetch_url_bytes(track["url"])
     if track.get("ext") == "json3":
         import json
 
@@ -481,25 +526,49 @@ def _ffmpeg() -> str:
     return exe
 
 
-# Fetched video-only streams, keyed by (video_id, max_height). Kept for the life
-# of the server process so repeated calls on the same video are instant, capped
-# so a long research session cannot fill the disk.
-_STREAM_CACHE: "OrderedDict[tuple[str, int], str]" = OrderedDict()
+# Fetched video-only streams, keyed by (video_id, max_height), value (path, info).
+# Kept for the life of the server process so repeated calls on the same video are
+# instant, capped so a long research session cannot fill the disk. Caching info
+# alongside the path means a cache hit needs zero network calls, not just a
+# cheap one - closes a gap where the "fast path" could fail on an unrelated
+# metadata refetch even though the file it actually needed was already local.
+_STREAM_CACHE: "OrderedDict[tuple[str, int], tuple[str, dict]]" = OrderedDict()
 _CACHE_LIMIT = 3
 _CACHE_DIR: Optional[str] = None
+# MCP's stdio transport is normally one request at a time, but nothing in the
+# protocol guarantees a client won't pipeline overlapping tool calls - this lock
+# makes the cache's check-then-act sequence atomic either way, for the cost of a
+# few lines. Frame extraction itself (the actual CPU/IO-bound work, one ffmpeg
+# subprocess per timestamp) stays outside the lock so concurrent calls on
+# different videos aren't serialized more than the cache bookkeeping requires.
+_CACHE_LOCK = threading.Lock()
 
 
 def _cache_dir() -> str:
+    """Create this run's temp dir, and best-effort sweep any left behind by a
+    prior run that didn't exit cleanly (atexit doesn't fire on a forceful kill,
+    so a long-lived install could otherwise accumulate one leftover directory
+    per crash). Never lets a sweep failure block startup.
+    """
     global _CACHE_DIR
-    if _CACHE_DIR is None:
-        _CACHE_DIR = tempfile.mkdtemp(prefix="yt-research-frames-")
-        atexit.register(shutil.rmtree, _CACHE_DIR, True)
-    return _CACHE_DIR
+    with _CACHE_LOCK:
+        if _CACHE_DIR is None:
+            parent = tempfile.gettempdir()
+            try:
+                for name in os.listdir(parent):
+                    if name.startswith("yt-research-frames-"):
+                        shutil.rmtree(os.path.join(parent, name), ignore_errors=True)
+            except OSError:
+                pass
+            _CACHE_DIR = tempfile.mkdtemp(prefix="yt-research-frames-")
+            atexit.register(shutil.rmtree, _CACHE_DIR, True)
+        return _CACHE_DIR
 
 
 def _evict(key: Optional[tuple[str, int]] = None) -> None:
     victim = key if key is not None else next(iter(_STREAM_CACHE))
-    path = _STREAM_CACHE.pop(victim, None)
+    entry = _STREAM_CACHE.pop(victim, None)
+    path = entry[0] if entry else None
     if path and os.path.exists(path):
         try:
             os.remove(path)
@@ -523,13 +592,11 @@ def _local_stream(video_id: str, max_height: int) -> tuple[str, dict]:
     The file is deleted when the server exits.
     """
     key = (video_id, max_height)
-    cached = _STREAM_CACHE.get(key)
-    if cached and os.path.exists(cached):
-        _STREAM_CACHE.move_to_end(key)
-        with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}",
-                                    download=False, process=False)
-        return cached, (info or {})
+    with _CACHE_LOCK:
+        cached = _STREAM_CACHE.get(key)
+        if cached and os.path.exists(cached[0]):
+            _STREAM_CACHE.move_to_end(key)
+            return cached
 
     url = f"https://www.youtube.com/watch?v={video_id}"
 
@@ -593,9 +660,10 @@ def _local_stream(video_id: str, max_height: int) -> tuple[str, dict]:
             )
         path = matches[0]
 
-    while len(_STREAM_CACHE) >= _CACHE_LIMIT:
-        _evict()
-    _STREAM_CACHE[key] = path
+    with _CACHE_LOCK:
+        while len(_STREAM_CACHE) >= _CACHE_LIMIT:
+            _evict()
+        _STREAM_CACHE[key] = (path, info)
     return path, info
 
 

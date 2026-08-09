@@ -3,36 +3,42 @@
 An MCP server that lets Claude research YouTube channels and read video transcripts,
 without a YouTube API key and without rendering a browser.
 
-## Why it exists
+## Legal status - read this before using it
 
-Fetching a YouTube channel page the ordinary way returns the app shell only. YouTube
-builds its pages in the browser with JavaScript, so a plain fetch gets an empty
-skeleton with no video list and no captions in it. That is what made an earlier
-attempt to mine FreeCAD tutorial channels come back with nothing usable.
+This talks to YouTube through [yt-dlp](https://github.com/yt-dlp/yt-dlp) rather than
+YouTube's official Data API, which is outside what YouTube's Terms of Service
+contemplate as sanctioned automated access. That's a real thing to know, not a
+formality:
 
-This server goes around that. It uses [yt-dlp](https://github.com/yt-dlp/yt-dlp),
-which talks to YouTube's own internal JSON endpoints, so it gets the real data
-directly. No API key, no browser, no scraping of rendered pages.
+- **`yt-dlp` itself is legal to build on and distribute.** It's public domain
+  (Unlicense), survived a 2020 DMCA takedown attempt (GitHub reinstated it after EFF
+  intervention, on the grounds it has substantial non-infringing uses), and has
+  millions of users. Individual open-source tools built on it, used for personal
+  research, have a long track record of being left alone.
+- **What has consistently drawn legal action is monetizing or centralizing access to
+  YouTube content** - commercial "download as a service" sites get sued and shut
+  down repeatedly. This project is released free, MIT-licensed, meant to be cloned
+  and run locally by each user against their own network - not offered as a hosted
+  service. Reselling access to it, or running it as a shared service many people
+  connect to, meaningfully changes that risk picture and isn't something this project
+  endorses.
+- **This is not legal advice**, and no one associated with this project is
+  liable for how you use it - see the [LICENSE](LICENSE)'s warranty disclaimer. If
+  you're planning anything beyond personal research use, get real legal review first.
+- YouTube's anti-automation measures (PO Tokens, bot-checks, IP-based rate limiting)
+  are real, active, and have escalated in 2026 specifically - see "Notes and limits"
+  below. This tool's reliability is inherently coupled to `yt-dlp`'s ability to keep
+  up; periodic maintenance (`pip install --upgrade yt-dlp`) is normal, not a sign
+  something is broken.
 
-Everything is read only. Video listings come from a flat playlist extraction (titles
-and IDs only, no video data), and transcripts are read straight from the caption track
-into memory. Only `get_video_frames` touches the disk, and only a temp file it deletes
-when the server exits.
+## How it works
 
-### Prior art, and why this exists anyway
-
-There are more than forty YouTube MCP servers out there, so this was checked before
-going further. The result was a clean split: **every server that works without an API
-key handles one video at a time, and every server that lists a channel needs a Google
-Data API key.** [kevinwatt/yt-dlp-mcp](https://github.com/kevinwatt/yt-dlp-mcp) (MIT,
-266 stars, the best maintained) has no channel enumeration at all.
-[labeveryday/youtube-mcp-server-enhanced](https://github.com/labeveryday/youtube-mcp-server-enhanced)
-advertises channel support, but reading its extractor shows `get_channel_info()`
-returns subscriber and view counts, not a video list.
-[ZubeidHendricks/youtube-mcp-server](https://github.com/ZubeidHendricks/youtube-mcp-server)
-and [space-cadet/yt-mcp](https://space-cadet.github.io/yt-mcp/) do list channels, and
-both require an API key. Licenses were all MIT, so nothing here was a copyleft problem
-either way. Nothing was close enough to fork.
+Uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) to talk to YouTube's own internal
+JSON endpoints directly, rather than rendering a page in a browser or calling the
+official Data API - no API key needed. Everything is read only. Video listings come
+from a flat playlist extraction (titles and IDs only, no video data), and transcripts
+are read straight from the caption track into memory. Only `get_video_frames` touches
+disk, and only a temp file it deletes when the server exits.
 
 ## Tools
 
@@ -108,36 +114,61 @@ channel or URL to one of the other two tools.
 ## Install and register
 
 The server has its own virtual environment on purpose, so installing yt-dlp here
-cannot disturb the other MCP servers that share `~/.claude/mcp-servers/.venv-mcp2`.
+cannot disturb any other MCP server's dependencies. You'll also need
+[ffmpeg](https://ffmpeg.org/download.html) on `PATH` for `get_video_frames` — the
+other three tools don't need it.
+
+**Windows (PowerShell):**
 
 ```powershell
-cd C:\Users\Diterex\Documents\Claude\youtube-research-mcp
+cd path\to\youtube-research-mcp
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+winget install Gyan.FFmpeg   # if ffmpeg isn't already on PATH
 ```
 
-Register it with Claude Code (user scope, so it is available in every project):
+**macOS / Linux:**
+
+```bash
+cd path/to/youtube-research-mcp
+python3 -m venv .venv
+./.venv/bin/python -m pip install -r requirements.txt
+brew install ffmpeg   # or apt-get install ffmpeg / your distro's package manager
+```
+
+Register it with Claude Code (user scope, so it is available in every project) —
+replace `path/to` with wherever you actually cloned this:
 
 ```powershell
 claude mcp add youtube-research --scope user -- `
-  C:\Users\Diterex\Documents\Claude\youtube-research-mcp\.venv\Scripts\python.exe `
-  C:\Users\Diterex\Documents\Claude\youtube-research-mcp\server.py
+  path\to\youtube-research-mcp\.venv\Scripts\python.exe `
+  path\to\youtube-research-mcp\server.py
 ```
 
-Or add it by hand to `~/.claude.json`:
+```bash
+claude mcp add youtube-research --scope user -- \
+  path/to/youtube-research-mcp/.venv/bin/python \
+  path/to/youtube-research-mcp/server.py
+```
+
+Or add it by hand to `~/.claude.json` (Windows path shown; use forward slashes and
+`.venv/bin/python` on macOS/Linux):
 
 ```json
 "youtube-research": {
   "type": "stdio",
-  "command": "C:\\Users\\Diterex\\Documents\\Claude\\youtube-research-mcp\\.venv\\Scripts\\python.exe",
-  "args": ["C:\\Users\\Diterex\\Documents\\Claude\\youtube-research-mcp\\server.py"]
+  "command": "C:\\path\\to\\youtube-research-mcp\\.venv\\Scripts\\python.exe",
+  "args": ["C:\\path\\to\\youtube-research-mcp\\server.py"]
 }
 ```
 
 ## Testing
 
 ```powershell
-.\.venv\Scripts\python.exe test_smoke.py
+.\.venv\Scripts\python.exe test_smoke.py    # Windows
+```
+```bash
+./.venv/bin/python test_smoke.py            # macOS/Linux
 ```
 
 This hits YouTube for real, with no mocking, deliberately - every real failure mode
@@ -182,7 +213,7 @@ here; what *is* verified is the fix and a real failure mode in it.
 
 ```
 YT_DLP_COOKIES_FROM_BROWSER=chrome    # or firefox, edge - see the caveat below
-YT_DLP_COOKIEFILE=C:\path\to\cookies.txt
+YT_DLP_COOKIEFILE=/path/to/cookies.txt
 ```
 
 **`YT_DLP_COOKIES_FROM_BROWSER` fails outright while that browser is running**,
@@ -208,10 +239,12 @@ client only offers 360p, which is too coarse to read a menu label.
 What does work is letting yt-dlp fetch the stream itself, since it holds the matching
 client session. That is cheap because the stream is video only, with no audio track
 requested. Measured on a 31 minute 720p tutorial: **32 MB in 5.7 seconds**, then frames
-come off the local file in well under a second each. The file is cached for the life of
-the server process, 3 videos maximum, so more frames from the same video are near
-instant. A second call on an already fetched video measured 1.3 seconds against 13.1
-cold.
+come off the local file in well under a second each. Both the file *and* its metadata
+are cached for the life of the server process (3 videos maximum), so a second call on
+an already-fetched video needs no network round trip at all - measured **0.1 seconds
+against 10.3 cold** (an earlier version of this cache kept only the file and refetched
+metadata on every hit, which still worked but cost about 1.3s per warm call - fixed in
+the pre-publish audit).
 
 **ffmpeg is required for frames only.** The other three tools do not need it. If it is
 missing, `get_video_frames` says so and tells you to run `winget install Gyan.FFmpeg`.
@@ -240,23 +273,50 @@ any `YoutubeDLError` yt-dlp raises comes back as a clean message, never a crash 
 your country" phrasing, matched by text since yt-dlp has no dedicated exception type
 for this. That specific branch is unverified against a real occurrence.
 
-**Transient failures on the frame-fetch path are retried automatically.** Only the
-large-stream download in `get_video_frames` does a real content fetch (the other three
-tools are lightweight metadata/caption calls, and 90 of those in a row - including a
-10-worker concurrent burst - produced zero failures). Confirmed real on 2026-08-08: a
-4-hour video's stream fetch returned HTTP 403 once, then succeeded seconds later with
-nothing else changed - a signed download URL failing in a way only a fresh extraction
-clears, not something yt-dlp's own `extractor_retries` covers, since that only retries
-metadata calls. `_local_stream` now retries the whole extraction (not just the byte
-fetch) up to 3 times with backoff - but skips retrying entirely for failures no retry
-could fix (cookie lock, live stream, private/unavailable, region-block), so those
-still fail in one attempt, not three.
+**Transient failures on both fetch paths are retried automatically.** The
+large-stream download in `get_video_frames` (the other three tools are lightweight
+metadata calls, and 90 of those in a row - including a 10-worker concurrent burst -
+produced zero failures during testing). Confirmed real on 2026-08-08: a 4-hour video's
+stream fetch returned HTTP 403 once, then succeeded seconds later with nothing else
+changed - a signed download URL failing in a way only a fresh extraction clears, not
+something yt-dlp's own `extractor_retries` covers, since that only retries metadata
+calls. `_local_stream` now retries the whole extraction (not just the byte fetch) up
+to 3 times with backoff - but skips retrying entirely for failures no retry could fix
+(cookie lock, live stream, private/unavailable, region-block), so those still fail in
+one attempt, not three. `get_video_transcript`'s caption-file fetch got the same
+retry logic in the pre-publish audit, on the same reasoning (caption URLs are signed
+and time-limited the same way stream URLs are) even though no failure was ever
+observed there in testing - proactive, not reactive.
+
+**Only youtube.com/youtu.be URLs are ever accepted.** `list_channel_videos` hands
+whatever URL it's given to yt-dlp's extractor, which has a generic fallback capable of
+fetching arbitrary URLs, not just YouTube's. Every full-URL input is checked against
+the actual host before anything else happens with it, and a non-YouTube host raises
+`ValueError` immediately. This matters specifically because MCP tools can be called by
+an agent acting on content it read elsewhere - without this check, a crafted playlist
+URL pointing somewhere else entirely could have made this server issue an outbound
+request to an attacker-chosen destination. Added in the pre-publish audit; the video-ID
+path (`get_video_transcript`, `get_video_frames`) never had this exposure in the first
+place, since it only ever extracts an 11-character ID and always re-embeds it into a
+hardcoded `youtube.com` URL, discarding whatever host the input actually had.
+
+**Two smaller pre-publish audit fixes, both defensive rather than reactive to an
+observed failure.** The temp directory `get_video_frames` downloads into is now
+swept for leftovers from a prior run's unclean exit (a forceful kill doesn't fire
+Python's `atexit`, so a long-lived install could otherwise accumulate one stray
+directory per crash). And the stream/metadata cache is now protected by a lock -
+the MCP stdio transport is normally one request at a time, but nothing in the
+protocol guarantees a client won't ever pipeline overlapping tool calls, and the
+cache's check-then-act sequence wasn't safe against that without one.
 
 **Keeping yt-dlp current.** YouTube changes its internals regularly and yt-dlp keeps
 up, so if extractions start failing the first thing to try is an upgrade.
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --upgrade yt-dlp
+.\.venv\Scripts\python.exe -m pip install --upgrade yt-dlp    # Windows
+```
+```bash
+./.venv/bin/python -m pip install --upgrade yt-dlp             # macOS/Linux
 ```
 
 ## Verified
