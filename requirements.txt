@@ -1,4 +1,0 @@
-# Deliberately minimal. yt-dlp does the YouTube work; mcp is the server framework.
-# server.py imports work on both mcp 1.x and 2.x.
-mcp>=2.0
-yt-dlp>=2026.7.4

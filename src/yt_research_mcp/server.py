@@ -1071,5 +1071,11 @@ def get_video_frames(
     return ["\n".join(lines)] + out
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point (registered in pyproject.toml as
+    `yt-research-mcp`) and the target of `python -m yt_research_mcp`."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

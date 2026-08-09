@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yt-research-mcp"
+version = "1.0.0"
+description = "MCP server for YouTube channel and transcript research - no API key, no browser rendering"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [
+    { name = "Diterex" },
+]
+keywords = ["mcp", "model-context-protocol", "youtube", "yt-dlp", "claude"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Multimedia :: Video",
+]
+
+# Deliberately minimal. yt-dlp does the YouTube work; mcp is the server
+# framework. server.py's own import guard works on both mcp 1.x and 2.x, but
+# we pin >=2.0 here as the tested floor.
+dependencies = [
+    "mcp>=2.0",
+    "yt-dlp>=2026.7.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/Diterex/youtube-research-mcp"
+Repository = "https://github.com/Diterex/youtube-research-mcp"
+Issues = "https://github.com/Diterex/youtube-research-mcp/issues"
+
+# `pip install yt-research-mcp` gives a `yt-research-mcp` command on PATH,
+# and `python -m yt_research_mcp` works the same way via __main__.py - either
+# is a valid target for an MCP client registration.
+[project.scripts]
+yt-research-mcp = "yt_research_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

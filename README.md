@@ -123,7 +123,7 @@ other three tools don't need it.
 ```powershell
 cd path\to\youtube-research-mcp
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install .
 winget install Gyan.FFmpeg   # if ffmpeg isn't already on PATH
 ```
 
@@ -132,43 +132,45 @@ winget install Gyan.FFmpeg   # if ffmpeg isn't already on PATH
 ```bash
 cd path/to/youtube-research-mcp
 python3 -m venv .venv
-./.venv/bin/python -m pip install -r requirements.txt
+./.venv/bin/python -m pip install .
 brew install ffmpeg   # or apt-get install ffmpeg / your distro's package manager
 ```
 
-Register it with Claude Code (user scope, so it is available in every project) —
-replace `path/to` with wherever you actually cloned this:
+That installs a `yt-research-mcp` console command into the venv - register it with
+Claude Code (user scope, so it is available in every project), replacing `path/to`
+with wherever you actually cloned this:
 
 ```powershell
 claude mcp add youtube-research --scope user -- `
-  path\to\youtube-research-mcp\.venv\Scripts\python.exe `
-  path\to\youtube-research-mcp\server.py
+  path\to\youtube-research-mcp\.venv\Scripts\yt-research-mcp.exe
 ```
 
 ```bash
 claude mcp add youtube-research --scope user -- \
-  path/to/youtube-research-mcp/.venv/bin/python \
-  path/to/youtube-research-mcp/server.py
+  path/to/youtube-research-mcp/.venv/bin/yt-research-mcp
 ```
 
-Or add it by hand to `~/.claude.json` (Windows path shown; use forward slashes and
-`.venv/bin/python` on macOS/Linux):
+Or add it by hand to `~/.claude.json` (Windows path shown; use forward slashes on
+macOS/Linux and drop the `.exe`):
 
 ```json
 "youtube-research": {
   "type": "stdio",
-  "command": "C:\\path\\to\\youtube-research-mcp\\.venv\\Scripts\\python.exe",
-  "args": ["C:\\path\\to\\youtube-research-mcp\\server.py"]
+  "command": "C:\\path\\to\\youtube-research-mcp\\.venv\\Scripts\\yt-research-mcp.exe"
 }
 ```
 
 ## Testing
 
+Editable install first, so test changes to the code without reinstalling:
+
 ```powershell
-.\.venv\Scripts\python.exe test_smoke.py    # Windows
+.\.venv\Scripts\python.exe -m pip install -e .     # Windows, once
+.\.venv\Scripts\python.exe test_smoke.py
 ```
 ```bash
-./.venv/bin/python test_smoke.py            # macOS/Linux
+./.venv/bin/python -m pip install -e .              # macOS/Linux, once
+./.venv/bin/python test_smoke.py
 ```
 
 This hits YouTube for real, with no mocking, deliberately - every real failure mode

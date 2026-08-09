@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 *.bak-*
 cookies.txt
+dist/
+build/
+*.egg-info/

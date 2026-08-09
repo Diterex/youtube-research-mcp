@@ -1,15 +1,18 @@
 """End-to-end smoke test - hits YouTube for real, no mocks.
 
 Run:  .venv\\Scripts\\python.exe test_smoke.py
-It lists two real channels, pulls one real transcript, runs a search, and checks
-that the URL parsers handle every shape of input we expect. Prints a PASS/FAIL
-line per check and exits non-zero if anything failed.
+Needs the package installed first (`pip install -e .` for local dev, or a
+plain `pip install .` also works since this test only imports it, never
+edits it). It lists two real channels, pulls one real transcript, runs a
+search, and checks that the URL parsers handle every shape of input we
+expect. Prints a PASS/FAIL line per check and exits non-zero if anything
+failed.
 """
 
 import sys
 import traceback
 
-import server
+from yt_research_mcp import server
 
 CHANNELS = ["https://www.youtube.com/@mwganson/videos",
             "https://www.youtube.com/@MangoJellySolutions/videos"]
