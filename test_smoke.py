@@ -75,7 +75,13 @@ def test_list(channel):
     v = r["videos"][0]
     for field in ("video_id", "title", "url", "duration"):
         assert v[field], f"missing {field} in {v}"
+    # Must hold even while YouTube's RSS feed is down (confirmed live 2026-08-10:
+    # it has returned bare 500s and 404s) - list_channel_videos now falls back to
+    # per-video resolution automatically. Offline coverage of the fallback logic
+    # itself lives in test_date_resolution.py; this only proves it's wired in.
     assert any(x["upload_date"] for x in r["videos"]), "no upload dates resolved"
+    if r["note"]:
+        print(f"      note: {r['note']}")
     print(f"      {r['channel']} - {r['total_videos']} videos total")
     for x in r["videos"]:
         print(f"      {x['upload_date']}  {x['duration']:>8}  {x['video_id']}  {x['title'][:60]}")

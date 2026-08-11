@@ -53,6 +53,14 @@ RSS_FEED = "https://www.youtube.com/feeds/videos.xml?channel_id={}"
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
 YT_NS = "{http://www.youtube.com/xml/schemas/2015}"
 
+# When the RSS feed itself is unreachable (not just silent on an old video -
+# genuinely down), list_channel_videos falls back to resolving dates one video
+# at a time via yt-dlp instead, same path resolve_all_dates uses. Capped so a
+# large max_results doesn't turn a feed outage into up to 1000 serial fetches;
+# ~20 roughly matches what the feed would have covered for free on a healthy
+# day, so the default call degrades to parity rather than losing dates outright.
+_RSS_FALLBACK_CAP = 20
+
 # Channel tabs that are a list of videos. Anything else gets rewritten to /videos.
 VIDEO_TABS = ("videos", "shorts", "streams")
 
@@ -303,28 +311,62 @@ def _entry_to_video(e: dict) -> dict:
 # Upload dates
 # --------------------------------------------------------------------------
 
-def _rss_dates(channel_id: Optional[str]) -> dict[str, str]:
+def _fetch_rss_bytes(channel_id: str) -> bytes:
+    """One HTTP GET of a channel's upload RSS feed. Split out from _rss_dates so
+    a test can fake just the network call and pin the retry/fallback logic
+    deterministically, the same way _run_search is split out for search_youtube.
+    """
+    with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
+        return ydl.urlopen(RSS_FEED.format(channel_id)).read()
+
+
+def _rss_dates(channel_id: Optional[str]) -> tuple[dict[str, str], bool]:
     """Upload dates for a channel's ~15 most recent videos, in one cheap request.
 
     A flat playlist extraction does not carry upload dates, and fetching each
-    video's metadata individually is slow. The channel's public RSS feed has
-    exact publish dates for recent uploads, which covers most research use.
+    video's metadata individually is slow (see _fill_all_dates). The channel's
+    public RSS feed has exact publish dates for recent uploads, which covers
+    most research use - when the feed is actually reachable, which is not
+    guaranteed: confirmed live 2026-08-10 that this endpoint can return a bare
+    HTTP 500 on one probe and a 404 on the very next one, for the same channel,
+    with no other change - not a one-off blip to retry through, an unreliable
+    dependency to have a real fallback for.
+
+    Returns (dates, feed_ok). feed_ok is False only when the feed request itself
+    failed after retries, or came back as something that isn't parseable feed
+    XML (e.g. an HTML error page served with a 200). The caller uses this to
+    tell "this video predates the feed's ~15-video window" (feed_ok=True, dates
+    just doesn't mention it - normal, no action needed) apart from "the feed is
+    down and nothing could be learned from it at all" (feed_ok=False - worth
+    falling back on).
     """
     if not channel_id:
-        return {}
+        return {}, True
+
+    raw: Optional[bytes] = None
+    for attempt in range(3):
+        try:
+            raw = _fetch_rss_bytes(channel_id)
+            break
+        except Exception as e:  # noqa: BLE001 - urlopen can raise outside yt-dlp's hierarchy
+            if _is_permanent_failure(str(e)) or attempt == 2:
+                break
+            time.sleep(1.5 * (attempt + 1))
+    if raw is None:
+        return {}, False
+
     try:
-        with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
-            raw = ydl.urlopen(RSS_FEED.format(channel_id)).read()
         root = ET.fromstring(raw)
-    except Exception:
-        return {}  # best effort only - never fail a listing over a missing date
+    except ET.ParseError:
+        return {}, False  # an error page served as the body parses as invalid XML
+
     dates: dict[str, str] = {}
     for entry in root.findall(f"{ATOM_NS}entry"):
         vid = entry.findtext(f"{YT_NS}videoId")
         published = entry.findtext(f"{ATOM_NS}published")
         if vid and published:
             dates[vid] = published[:10]
-    return dates
+    return dates, True
 
 
 def _one_video_date(video_id: str) -> tuple[str, Optional[str]]:
@@ -970,6 +1012,8 @@ def list_channel_videos(
           "channel_url": str,           # URL actually listed
           "total_videos": int | None,   # total on the channel/playlist, if known
           "count": int,                 # videos in this response
+          "note": str,                  # non-empty only when date resolution had
+                                         # to fall back - see resolve_all_dates
           "videos": [
             {
               "video_id": str,            # e.g. "Tbiu_rMJolk"
@@ -982,6 +1026,13 @@ def list_channel_videos(
             }
           ]
         }
+        If the RSS feed itself is unreachable (confirmed to happen: it has
+        returned bare HTTP 500s and 404s), this falls back automatically to
+        resolving dates one video at a time via yt-dlp - same source
+        resolve_all_dates uses - for up to the first 20 videos, so a listing
+        never silently loses every date to a single feed outage. "note"
+        explains when that happened; pass resolve_all_dates=True to lift the
+        20-video cap and date everything that way.
 
     Errors:
         Raises ValueError for an unparseable channel reference and RuntimeError
@@ -1000,12 +1051,32 @@ def list_channel_videos(
     videos = [_entry_to_video(e) for e in entries][:max_results]
 
     channel_id = info.get("channel_id")
-    for vid, date in _rss_dates(channel_id).items():
+    rss_dates, feed_ok = _rss_dates(channel_id)
+    for vid, date in rss_dates.items():
         for v in videos:
             if v["video_id"] == vid:
                 v["upload_date"] = date
+
+    note = ""
     if resolve_all_dates:
         _fill_all_dates(videos)
+    elif not feed_ok and videos:
+        fallback = videos[:_RSS_FALLBACK_CAP]
+        _fill_all_dates(fallback)
+        capped = len(videos) > len(fallback)
+        note = (
+            "YouTube's upload-date RSS feed did not respond (not just silent on "
+            "an old video - the request itself failed), so dates for "
+            f"{'the first ' + str(len(fallback)) if capped else 'all'} "
+            f"video{'s' if len(fallback) != 1 else ''} were resolved individually "
+            "via yt-dlp instead - slower per video, same accuracy."
+        )
+        if capped:
+            note += (
+                f" The remaining {len(videos) - len(fallback)} do not have a "
+                "resolved date here; pass resolve_all_dates=True to resolve "
+                "every video this way."
+            )
 
     return {
         "channel": info.get("channel") or info.get("uploader") or info.get("title"),
@@ -1013,6 +1084,7 @@ def list_channel_videos(
         "channel_url": url,
         "total_videos": info.get("playlist_count"),
         "count": len(videos),
+        "note": note,
         "videos": videos,
     }
 
