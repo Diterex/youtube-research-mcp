@@ -123,6 +123,38 @@ def test_frames(video_id):
         except ValueError:
             continue
         raise AssertionError(f"{why} should have raised ValueError")
+
+
+def test_frames_saved_to_disk(video_id):
+    """The whole point of output_dir: no separate yt-dlp+ffmpeg workaround
+    needed to get frame files on disk - this call alone must produce them.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    d = tempfile.mkdtemp(prefix="yt-research-smoke-")
+    try:
+        out = server.get_video_frames(video_id, timestamps=["1:00", "2:00"], output_dir=d)
+        summary, images = out[0], out[1:]
+        files = sorted(os.listdir(d))
+        assert len(files) == 2, f"expected 2 saved files, found {files}"
+        assert len(images) == 2, "output_dir must not remove the default inline images"
+        for f in files:
+            full = os.path.join(d, f)
+            assert os.path.getsize(full) > 5000, f"{f} came back suspiciously small"
+            with open(full, "rb") as fh:
+                assert fh.read(2) == b"\xff\xd8", f"{f} is not a JPEG"
+        print(f"      saved: {files}")
+
+        # include_images=False: same files on disk, zero inline images this time.
+        out2 = server.get_video_frames(
+            video_id, timestamps=["1:00"], output_dir=d, include_images=False)
+        assert out2[1:] == [], "include_images=False must return no inline images"
+        print(f"      include_images=False -> {len(out2[1:])} inline images (expected 0)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return True
     return True
 
 
@@ -217,6 +249,7 @@ if __name__ == "__main__":
     if first:
         check(f"get_video_transcript {first}", lambda: test_transcript(first))
         check(f"get_video_frames {first}", lambda: test_frames(first))
+        check(f"get_video_frames output_dir {first}", lambda: test_frames_saved_to_disk(first))
     check("search_youtube", test_search)
     check("search_youtube broadening (live)", test_search_broadening_live)
     check("search_youtube auto_broaden=False", test_search_exact_mode_makes_no_extra_requests)

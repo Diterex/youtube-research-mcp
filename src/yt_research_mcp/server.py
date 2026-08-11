@@ -6,12 +6,16 @@ tools come back empty. This server goes through yt-dlp's extractors instead,
 which read YouTube's own internal JSON endpoints. No YouTube Data API key, no
 browser rendering, no scraping of rendered HTML.
 
-Everything here is read-only: no channel is modified, no video is uploaded,
-nothing is posted anywhere. Disk use is minimal and deliberate - video listings
-and transcripts never touch disk (a flat playlist extraction and a caption track
-read straight into memory), and get_video_frames downloads only a small
-video-only stream to a temp file it deletes on exit, never the full video with
-audio.
+Everything here is read-only against YouTube itself: no channel is modified, no
+video is uploaded, nothing is posted anywhere. Disk use is minimal and
+deliberate - video listings and transcripts never touch disk (a flat playlist
+extraction and a caption track read straight into memory), and get_video_frames
+downloads only a small video-only stream to a temp file it deletes on exit,
+never the full video with audio. The one deliberate exception is
+get_video_frames' optional output_dir: when a caller explicitly asks, extracted
+frame JPEGs (never the video itself) are written to a caller-chosen local
+directory instead of only being returned in-context - opt-in, and nothing else
+in this server persists anything anywhere.
 """
 
 from __future__ import annotations
@@ -970,6 +974,34 @@ def _grab_frame(args: tuple[str, float, int, int]) -> tuple[float, Optional[byte
     return seconds, proc.stdout, None
 
 
+def _frame_filename(video_id: str, seconds: float) -> str:
+    """video_id is already known filesystem-safe (validated by _video_id's
+    [\\w-]{11} match before it ever reaches here). Zero-padded H-M-S, not a
+    colon-separated H:MM:SS: Windows rejects ':' in filenames, and padding
+    keeps a directory of frames sorted chronologically by name.
+    """
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{video_id}_{h:02d}-{m:02d}-{sec:02d}.jpg"
+
+
+def _save_frame(directory: str, video_id: str, seconds: float, jpeg: bytes) -> tuple[str, Optional[str]]:
+    """Write one already-captured frame to disk. Returns (path, error) with
+    error None on success. Never raises: a single frame's write failing (full
+    disk, permission denied mid-run) must not lose the frames saved before or
+    after it in the same call, matching how a single frame's ffmpeg failure
+    already can't fail the rest of get_video_frames.
+    """
+    path = os.path.join(directory, _frame_filename(video_id, seconds))
+    try:
+        with open(path, "wb") as f:
+            f.write(jpeg)
+    except OSError as e:
+        return path, str(e)
+    return path, None
+
+
 # --------------------------------------------------------------------------
 # Tools
 # --------------------------------------------------------------------------
@@ -1451,7 +1483,10 @@ def search_youtube(
     name="get_video_frames",
     annotations={
         "title": "Grab video frames at chosen moments",
-        "readOnlyHint": True,
+        # False, not True: with output_dir set this writes JPEG files to a
+        # caller-chosen local directory. Still opt-in and still never touches
+        # YouTube itself - see destructiveHint/idempotentHint below.
+        "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
@@ -1465,8 +1500,11 @@ def get_video_frames(
     width: int = 1280,
     max_height: int = 720,
     quality: int = 4,
+    output_dir: Optional[str] = None,
+    include_images: bool = True,
 ) -> list:
-    """See what a video actually shows at chosen moments. Returns real images.
+    """See what a video actually shows at chosen moments. Returns real images,
+    and can save them to disk in the same call.
 
     Transcripts cannot capture a screen-based tutorial. "Click this, then drag it
     here" has no referent in text, toolbar clicks are usually silent, typed
@@ -1495,28 +1533,43 @@ def get_video_frames(
         every_seconds: Instead of explicit timestamps, sample evenly this many
             seconds apart. Use only when surveying an unfamiliar video; explicit
             timestamps are far cheaper. Ignored if timestamps is given.
-        max_frames: Hard cap on frames returned (1-20, default 6). Every frame
-            costs context, so keep this tight.
+        max_frames: Hard cap on frames captured (1-50, default 6). Applies
+            whether or not output_dir is set - it bounds the ffmpeg work this
+            call does, not just the context cost of returning images.
         width: Output width in pixels (320-1920, default 1280). Do not go below
             about 960 if you need to read menu labels or dialog values.
         max_height: Source stream height to fetch (default 720, which is enough
             to read a CAD toolbar and keeps the fetch small). Raise to 1080 only
             if 720 proves too coarse.
         quality: JPEG quality, 2 is best and 31 is worst (default 4).
+        output_dir: A local directory to save each captured frame to as a JPEG,
+            e.g. "C:/research/freecad-sketcher". Created if it does not exist.
+            Written from the same ffmpeg output already being produced for the
+            in-context images - no separate download or re-extraction. Files are
+            named "{video_id}_{HH-MM-SS}.jpg"; saving the same timestamp again
+            overwrites the same file. None (default) saves nothing.
+        include_images: True (default) returns each frame inline as before.
+            Set False only when output_dir is given and you don't want the
+            context cost of inline images - e.g. saving many frames for later,
+            offline use rather than looking at them in this conversation.
 
     Returns:
-        A list whose first item is a text summary (video title, duration, and the
-        timestamp of each frame in order), followed by one image per timestamp.
-        Frames that could not be captured are reported in the summary text rather
+        A list whose first item is a text summary (video title, duration, the
+        timestamp of each frame, and - when output_dir is set - the path each
+        frame was saved to or why it wasn't), followed by one image per
+        timestamp if include_images is True. Frames that could not be captured,
+        or captured but failed to save, are reported in the summary text rather
         than failing the whole call.
 
     Errors:
-        Raises ValueError for bad arguments or unparseable timestamps, and
-        RuntimeError if ffmpeg is missing or the video has no playable stream.
+        Raises ValueError for bad arguments or unparseable timestamps (including
+        include_images=False with no output_dir, which would return nothing at
+        all), and RuntimeError if ffmpeg is missing, the video has no playable
+        stream, or output_dir cannot be created.
     """
     vid = _video_id(video_url_or_id)
-    if not 1 <= max_frames <= 20:
-        raise ValueError("max_frames must be between 1 and 20.")
+    if not 1 <= max_frames <= 50:
+        raise ValueError("max_frames must be between 1 and 50.")
     if not 320 <= width <= 1920:
         raise ValueError("width must be between 320 and 1920.")
     if not 2 <= quality <= 31:
@@ -1528,7 +1581,23 @@ def get_video_frames(
             "Give either timestamps=['4:12', ...] or every_seconds=N. Prefer "
             "timestamps taken from a timestamped transcript - it is much cheaper."
         )
+    if not include_images and not output_dir:
+        raise ValueError(
+            "include_images=False with no output_dir would return no frames at "
+            "all. Set output_dir to save frames to disk, or drop "
+            "include_images=False to get them inline."
+        )
+    if output_dir is not None and not output_dir.strip():
+        raise ValueError("output_dir is empty - pass a real directory path or omit it.")
     _ffmpeg()  # fail fast with an install hint rather than after the fetch
+
+    resolved_dir: Optional[str] = None
+    if output_dir:
+        resolved_dir = os.path.abspath(os.path.expanduser(output_dir.strip()))
+        try:
+            os.makedirs(resolved_dir, exist_ok=True)
+        except OSError as e:
+            raise RuntimeError(f"Could not create or use output_dir '{resolved_dir}': {e}") from e
 
     path, info = _local_stream(vid, max_height)
     duration = info.get("duration")
@@ -1568,17 +1637,38 @@ def get_video_frames(
         f"{info.get('title')} [{_hms(duration)}] - frames from "
         f"https://www.youtube.com/watch?v={vid}",
     ]
+    saved = 0
+    save_failures = 0
     for seconds, jpeg, err in results:
-        if jpeg:
-            lines.append(f"  [{_hms(seconds)}] captured ({len(jpeg) // 1024} KB)")
-            out.append(Image(data=jpeg, format="jpeg"))
-        else:
+        if not jpeg:
             lines.append(f"  [{_hms(seconds)}] FAILED: {err}")
+            continue
+        size = f"({len(jpeg) // 1024} KB)"
+        if include_images:
+            out.append(Image(data=jpeg, format="jpeg"))
+        if resolved_dir:
+            saved_path, save_err = _save_frame(resolved_dir, vid, seconds, jpeg)
+            if save_err:
+                save_failures += 1
+                lines.append(f"  [{_hms(seconds)}] captured {size} - FAILED TO SAVE: {save_err}")
+            else:
+                saved += 1
+                lines.append(f"  [{_hms(seconds)}] captured {size} -> {saved_path}")
+        else:
+            lines.append(f"  [{_hms(seconds)}] captured {size}")
     if dropped:
         lines.append(f"  ({dropped} more timestamps dropped by max_frames={max_frames})")
     if over:
         lines.append(f"  ({len(over)} timestamps ignored as past the end of the video)")
     lines.append("Frames are listed in the same order as the timestamps above.")
+    if resolved_dir:
+        if saved:
+            lines.append(f"Saved {saved} frame file{'s' if saved != 1 else ''} to {resolved_dir}")
+        if save_failures:
+            lines.append(
+                f"{save_failures} frame{'s' if save_failures != 1 else ''} captured but could not "
+                "be saved to disk - see FAILED TO SAVE lines above."
+            )
 
     return ["\n".join(lines)] + out
 

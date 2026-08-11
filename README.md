@@ -75,9 +75,10 @@ fallback. The result reports which you got in `transcript_kind`, along with `tit
 `channel`, `duration`, `upload_date`, `language`, `char_count`, `truncated`, and the
 `transcript` itself as paragraphs of roughly 30 seconds each.
 
-### `get_video_frames(video_url_or_id, timestamps=None, every_seconds=0, max_frames=6, width=1280, max_height=720, quality=4)`
+### `get_video_frames(video_url_or_id, timestamps=None, every_seconds=0, max_frames=6, width=1280, max_height=720, quality=4, output_dir=None, include_images=True)`
 
-Returns actual images of what the video shows at chosen moments.
+Returns actual images of what the video shows at chosen moments, and can save them to
+disk in the same call.
 
 **Transcripts alone cannot capture a screen based tutorial.** "Click this, then drag it
 here" has no referent in text. Toolbar clicks are usually silent. Typed dialog values
@@ -96,14 +97,23 @@ cheap.
 - `timestamps` is a list of `'S'`, `'M:SS'` or `'H:MM:SS'` strings, taken from step 1.
 - `every_seconds` samples evenly instead, for surveying an unfamiliar video. Explicit
   timestamps are far cheaper.
-- `max_frames` caps the result at 1 to 20, default 6. Every frame costs context.
+- `max_frames` caps the result at 1 to 50, default 6. Every frame costs context when
+  returned inline - see `include_images` below if you just want files on disk.
 - `width` is the output width, 320 to 1920, default 1280. Do not go below about 960 if
   you need to read menu labels.
 - `max_height` is the source stream height fetched, default 720. That is enough to read
   a CAD toolbar and keeps the fetch small.
+- `output_dir` saves every captured frame as a JPEG to a local directory (created if it
+  doesn't exist), named `{video_id}_{HH-MM-SS}.jpg`. Written straight from the same
+  ffmpeg output already produced for the in-context images - no separate download or
+  re-extraction needed. `None` (default) saves nothing, same as before this existed.
+- `include_images` defaults to `True` (frames returned inline, as always). Set `False`
+  only alongside `output_dir` to skip the context cost when you just want files saved,
+  not looked at in this conversation.
 
-Returns a text summary followed by one image per timestamp. Frames that fail are noted
-in the summary rather than failing the whole call.
+Returns a text summary followed by one image per timestamp (unless `include_images` is
+`False`). Frames that fail to capture, or capture but fail to save, are noted in the
+summary rather than failing the whole call.
 
 ### `search_youtube(query, max_results=20, broader_terms=None, auto_broaden=True)`
 
