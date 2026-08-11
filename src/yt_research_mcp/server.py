@@ -488,6 +488,244 @@ def _to_blocks(lines: list[tuple[float, str]], block_seconds: int, timestamps: b
 
 
 # --------------------------------------------------------------------------
+# Search broadening and relevance scoring
+#
+# The problem this solves, from a real research session: a narrow,
+# academically-phrased query ("additive manufacturing parameter optimisation
+# for viscoelastic ceramic feedstock") returned almost nothing, while a blunt
+# practitioner phrasing of the same topic ("clay 3d printing") found the best
+# material in the whole effort. Nobody should have to remember to re-run the
+# blunt version by hand.
+#
+# HONEST LIMIT, stated up front because it shapes everything below: this module
+# is plain Python with no model in it. It cannot invent a synonym, and it cannot
+# know that "clay printing" and "viscoelastic ceramic feedstock" are the same
+# subject. So the work is split by who can actually do it:
+#
+#   * Mechanical broadening (this file, always available, zero caller effort):
+#     shorten the query. Drop academic register words, keep the head of the noun
+#     phrase, keep the lead of it. These are strictly SUBSETS of what the caller
+#     already typed - no new vocabulary is invented, because none can be.
+#   * Semantic broadening (the CALLER's job, via broader_terms): real synonyms
+#     and adjacent tool/software names. The calling session is an LLM and can
+#     generate these trivially; this function cannot generate even one. When
+#     broader_terms is absent the returned "note" says so explicitly, so the
+#     caller learns to supply them next time rather than silently getting the
+#     weaker half of the feature.
+#   * Re-ranking (this file): score every result by lexical coverage of the
+#     topic vocabulary, so genuinely on-topic results float and the noise a
+#     deliberately over-broad query drags in gets dropped again.
+# --------------------------------------------------------------------------
+
+# Extra searches a single call may run beyond the narrow one. They run in
+# parallel, so the wall-clock cost of broadening is roughly one search, but the
+# request count is not free - hence a hard cap.
+_MAX_BROAD_QUERIES = 4
+
+# Phase-1 trigger. If fewer than _MIN_RELEVANT narrow results score at least
+# _RELEVANT_AT, the narrow pass is treated as thin and broadening runs. Zero
+# results trivially satisfies this, so both of Jacob's trigger conditions -
+# nothing at all, and results that came back but do not look on-topic - go
+# through the same check.
+_RELEVANT_AT = 0.34
+_MIN_RELEVANT = 3
+
+# Phase-3 keep bar for results the user did not ask for. Deliberately HIGHER
+# than _RELEVANT_AT: a result surfaced by a query the caller never typed has to
+# prove itself harder than one that came back from their own words.
+_BROAD_KEEP_AT = 0.5
+
+# Dropped before scoring and before building the shortened variants. Ordinary
+# English glue; carries no topic signal in a video title.
+_STOPWORDS = frozenset("""
+a an the and or of for to in on at by with without from into as is are be been
+being how what why when where which who this that these those it its your you
+my our their his her i we they do does did can could should would will if but
+not no all any some more most much many other another such via using use used
+than then so too very just about over under between during within across per
+top best new latest guide part
+""".split())
+
+# Dropped ONLY when building the shortened "core" variant, never when scoring.
+# These are register words: they mark how a topic is being written about rather
+# than what the topic is, and they are what makes an academic phrasing miss on a
+# platform whose titles are written by practitioners. A result that does mention
+# them is still relevant, which is why scoring keeps them.
+#
+# This is a fixed, closed, domain-independent list. It is NOT a synonym table
+# and deliberately never grows into one - a hardcoded synonym table would be a
+# fake version of the semantic broadening only the caller can really do.
+_REGISTER_WORDS = frozenset("""
+analysis analyses approach approaches assessment characterisation
+characterization comparative comparison considerations effect effects empirical
+evaluation experimental exploration framework implications influence
+investigation method methodology methods model modelling modeling novel
+optimisation optimization overview parameter parameters principles properties
+qualitative quantitative research review strategies strategy studies study
+survey systematic techniques theoretical toward towards understanding
+""".split())
+
+_WORD_RE = re.compile(r"[a-z0-9][a-z0-9'+#-]*")
+
+
+def _tokens(text: Optional[str]) -> list[str]:
+    return _WORD_RE.findall((text or "").lower())
+
+
+def _content_terms(text: Optional[str]) -> list[str]:
+    """Topic-carrying words, in the order they were written."""
+    return [t for t in _tokens(text) if t not in _STOPWORDS and len(t) > 1]
+
+
+def _stem(token: str) -> str:
+    """Crude suffix stripper so 'constraints' matches 'constraint' and
+    'printing' matches 'print'. Deliberately not a real stemmer: no dependency,
+    no language model, and its failures are all of the same harmless kind -
+    two related words that fail to unify simply score as a miss.
+    """
+    t = token
+    if len(t) > 4 and t.endswith("ies"):
+        t = t[:-3] + "y"
+    for suffix in ("ations", "ation", "ings", "ing", "ers", "er", "ed", "es", "s"):
+        if t.endswith(suffix) and len(t) > len(suffix) + 2:
+            return t[: -len(suffix)]
+    return t
+
+
+def _stems(tokens: list[str]) -> list[str]:
+    return [_stem(t) for t in tokens]
+
+
+def _term_hits(stem: str, haystack: list[str]) -> bool:
+    """One topic word against a result's words. Exact stem match, or - only for
+    stems long enough that a coincidence is unlikely - containment either way,
+    which recovers pairs the crude stemmer splits ('constrain'/'constraint').
+    """
+    if stem in haystack:
+        return True
+    if len(stem) < 5:
+        return False
+    return any(stem in h or (len(h) >= 5 and h in stem) for h in haystack)
+
+
+def _group_score(group: list[str], haystack: list[str]) -> float:
+    """How much of ONE phrasing of the topic a result covers, 0.0 to 1.0."""
+    if not group:
+        return 0.0
+    unique = list(dict.fromkeys(group))
+    matched = sum(1 for s in unique if _term_hits(s, haystack))
+    score = matched / len(unique)
+    # Small bonus when two topic words appear side by side in the result, which
+    # is much stronger evidence than the same two words scattered.
+    for a, b in zip(group, group[1:]):
+        if any(haystack[i] == a and haystack[i + 1] == b for i in range(len(haystack) - 1)):
+            score += 0.08
+    return min(1.0, score)
+
+
+def _topic_groups(query: str, broader_terms: Optional[list[str]]) -> list[list[str]]:
+    """The vocabularies a result may satisfy, as lists of stems.
+
+    Group 0 is the caller's original query. Each broader_term the caller passed
+    becomes its OWN group, not extra words bolted onto group 0 - because the
+    caller is asserting "this is another way of naming the same subject", and a
+    result should be able to satisfy it completely on its own. A video titled
+    "Clay 3D printing basics" fully covers the group ['clay', '3d', 'print'] and
+    scores 1.0, even though it shares no word at all with an academic query.
+    Merging everything into one bag would instead have scored it about 0.2 and
+    thrown it away - which is exactly the failure this whole feature exists to
+    fix.
+
+    The mechanical shortenings do NOT get groups: they are subsets of group 0,
+    so anything they surfaced would trivially score 1.0 against itself and the
+    filter would stop filtering.
+    """
+    groups = [_stems(_content_terms(query))]
+    for term in broader_terms or []:
+        stems = _stems(_content_terms(term))
+        if stems:
+            groups.append(stems)
+    return [g for g in groups if g]
+
+
+def _relevance(video: dict, groups: list[list[str]]) -> float:
+    """Best coverage across all accepted phrasings of the topic.
+
+    The haystack is title + channel name: a channel called "Ceramic 3D Printing"
+    is real evidence about a video whose title alone is "Episode 12".
+    """
+    haystack = _stems(_tokens(f"{video.get('title') or ''} {video.get('channel') or ''}"))
+    return max((_group_score(g, haystack) for g in groups), default=0.0)
+
+
+def _mechanical_variants(query: str) -> list[str]:
+    """Shortened rewrites of the query, best first. No new words are invented.
+
+    Three shapes, because there is no reliable way to know which word carries
+    the topic without a parser:
+      core - everything except academic register words. Mild; keeps breadth.
+      head - the last three content words. English noun phrases put the head
+             noun last ("...viscoelastic ceramic feedstock").
+      lead - the first three content words. Recovers the opposite case, where
+             the distinctive token is a product name up front ("FreeCAD ...").
+    A query of three content words or fewer cannot be shortened at all; that
+    returns an empty list and the caller is told so in the note.
+    """
+    terms = _content_terms(query)
+    core = [t for t in terms if t not in _REGISTER_WORDS]
+    variants: list[str] = []
+    for candidate in (core, core[-3:], core[:3]):
+        if len(candidate) < 2:
+            continue
+        text = " ".join(candidate)
+        if text != " ".join(terms) and text not in variants:
+            variants.append(text)
+    return variants
+
+
+def _run_search(query: str, max_results: int) -> list[dict]:
+    """One yt-dlp keyword search, normalised to this server's video shape.
+
+    Split out as its own function so the broadening and re-ranking logic can be
+    tested without touching the network.
+    """
+    info = _extract(f"ytsearch{max_results}:{query}", extract_flat="in_playlist")
+    videos = []
+    for e in info.get("entries") or []:
+        if not e:
+            continue
+        v = _entry_to_video(e)
+        v.pop("upload_date", None)
+        v["channel"] = e.get("channel") or e.get("uploader")
+        v["channel_url"] = e.get("channel_url") or e.get("uploader_url")
+        videos.append(v)
+    return videos
+
+
+def _suggested_channels(videos: list[dict], limit: int = 5) -> list[dict]:
+    """Channels that scored well more than once - the concrete 'narrow back in'
+    handle. Costs no extra request: it is read off results already in hand, and
+    feeds straight into list_channel_videos.
+    """
+    tally: dict[str, dict] = {}
+    for v in videos:
+        name = v.get("channel")
+        if not name or v.get("relevance", 0.0) < _BROAD_KEEP_AT:
+            continue
+        row = tally.setdefault(name, {"channel": name, "channel_url": v.get("channel_url"), "hits": 0, "_score": 0.0})
+        row["hits"] += 1
+        row["_score"] += v.get("relevance", 0.0)
+    ranked = sorted(
+        (r for r in tally.values() if r["hits"] >= 2),
+        key=lambda r: (r["hits"], r["_score"]),
+        reverse=True,
+    )
+    for r in ranked:
+        r.pop("_score", None)
+    return ranked[:limit]
+
+
+# --------------------------------------------------------------------------
 # Frame grabbing
 # --------------------------------------------------------------------------
 
@@ -888,51 +1126,253 @@ def get_video_transcript(
         "openWorldHint": True,
     },
 )
-def search_youtube(query: str, max_results: int = 20) -> dict:
-    """Search YouTube by keyword when you do not yet know the channel or video.
+def search_youtube(
+    query: str,
+    max_results: int = 20,
+    broader_terms: Optional[list[str]] = None,
+    auto_broaden: bool = True,
+) -> dict:
+    """Search YouTube by keyword, widening the search itself when it comes back thin.
 
     The entry point for research that starts from a topic rather than a URL: find
     candidate videos here, then feed their channel or URL to list_channel_videos
     or get_video_transcript.
 
+    ALWAYS PASS broader_terms. It is the single highest-value thing you can do
+    for a research search, and only you can do it. This function is plain Python
+    with no model in it: it can shorten your query, but it cannot possibly guess
+    that "clay 3D printing", "paste extrusion" and "ceramic additive
+    manufacturing" name one subject, or that a question about a CAD operation is
+    also answered by videos about a different CAD program that has the same
+    operation. You know that; it does not. Give it 2-3 genuinely different
+    phrasings - practitioner slang, the blunt everyday name for the thing, and
+    the adjacent tool or software names - and it will search them for you and
+    fold the good results back in. Real case this exists for: an academic
+    phrasing returned almost nothing while "clay 3d printing" found the best
+    material of the entire session.
+
+    What it does, in three phases:
+      1. Runs your query exactly as written.
+      2. If that came back empty OR came back with results that do not look
+         on-topic, it widens: your broader_terms first, plus shortened rewrites
+         of your own query (register words like "optimization" and "methodology"
+         dropped, then the head and the lead of the phrase). Up to four extra
+         searches, run in parallel, so widening costs about one search of time.
+      3. Narrows back in: every result is scored on how much of the topic
+         vocabulary it actually covers, results the wide pass dragged in that
+         are off-topic get dropped, and what remains is sorted best-first.
+    When phase 1 already looks healthy, phases 2 and 3 do not run and nothing
+    extra is fetched.
+
     Args:
         query: Free-text search, e.g. "FreeCAD sketcher constraints tutorial".
+            Write it the way you actually mean it; broadening is handled here.
         max_results: How many results to return (1-100, default 20).
+        broader_terms: Alternate phrasings of the SAME topic, e.g.
+            ["clay 3d printing", "paste extruder", "ceramic 3d printer"]. Used
+            two ways: as extra searches, and as accepted vocabulary when
+            scoring, so a video that matches one of these fully is kept even if
+            it shares no word with your original query. 2-3 is the sweet spot.
+        auto_broaden: True (default) allows phases 2 and 3. Set False only when
+            you deliberately want the raw result of this exact query and nothing
+            else - it makes the call behave exactly as it did before this
+            feature existed.
 
     Returns:
         {
-          "query": str,
+          "query": str,                  # your original query, unchanged
           "count": int,
+          "broadened": bool,             # whether phases 2-3 ran
+          "queries_run": [ {"query": str, "kind": str, "results": int} ],
+                                         # kind: narrow | caller | mechanical
+          "dropped_as_off_topic": int,   # wide-pass results the re-rank rejected
+          "low_confidence": bool,        # true only when your query found NOTHING
+                                         # and these are best-effort wide hits
+          "suggested_channels": [ {"channel", "channel_url", "hits"} ],
+                                         # channels that scored well repeatedly -
+                                         # feed to list_channel_videos next
+          "note": str,                   # what happened and what to do about it
           "videos": [ {video_id, title, url, duration_seconds, duration,
-                       view_count, channel} ]
+                       view_count, channel, channel_url,
+                       relevance,         # 0.0-1.0 topic coverage
+                       found_via} ]       # "your query" or the wider query used
         }
+        Results are in YouTube's own ranking order when nothing was broadened,
+        and in relevance order (ties keeping YouTube's order) when it was.
         Search results carry no upload date; call get_video_transcript or
         list_channel_videos if you need one.
 
     Errors:
-        Raises ValueError on an empty query and RuntimeError if the search fails.
+        Raises ValueError on an empty query and RuntimeError if the search of
+        your original query fails. A failure in one of the wider searches never
+        fails the call - it is reported in "note" instead.
     """
     q = (query or "").strip()
     if not q:
         raise ValueError("query is empty.")
     if max_results < 1 or max_results > 100:
         raise ValueError("max_results must be between 1 and 100.")
+    terms = [t.strip() for t in (broader_terms or []) if t and t.strip()]
 
+    groups = _topic_groups(q, terms)
+    queries_run: list[dict] = []
+    notes: list[str] = []
+
+    # ---- Phase 1: the caller's query, exactly as written --------------------
     try:
-        info = _extract(f"ytsearch{max_results}:{q}", extract_flat="in_playlist")
+        narrow = _run_search(q, max_results)
     except YoutubeDLError as e:
         raise RuntimeError(_friendly_error(f"search '{q}'", e)) from e
+    queries_run.append({"query": q, "kind": "narrow", "results": len(narrow)})
+    for v in narrow:
+        v["relevance"] = round(_relevance(v, groups), 3)
+        v["found_via"] = "your query"
 
-    videos = []
-    for e in (info.get("entries") or []):
-        if not e:
+    relevant = [v for v in narrow if v["relevance"] >= _RELEVANT_AT]
+    thin = len(relevant) < _MIN_RELEVANT
+
+    if not auto_broaden or not thin:
+        if not auto_broaden:
+            notes.append("auto_broaden=False, so only your exact query was run.")
+        else:
+            notes.append(
+                f"Your query returned {len(relevant)} on-topic results, so no "
+                "widening was needed and no extra searches were made."
+            )
+        return {
+            "query": q,
+            "count": len(narrow),
+            "broadened": False,
+            "queries_run": queries_run,
+            "dropped_as_off_topic": 0,
+            "low_confidence": False,
+            "suggested_channels": _suggested_channels(narrow),
+            "note": " ".join(notes),
+            "videos": narrow[:max_results],
+        }
+
+    # ---- Phase 2: widen -----------------------------------------------------
+    # Caller-supplied phrasings go first: they are the only ones carrying real
+    # meaning. Mechanical shortenings fill whatever budget is left.
+    candidates = [(t, "caller") for t in terms[:2]]
+    candidates += [(m, "mechanical") for m in _mechanical_variants(q)]
+    seen_q = {q.lower()}
+    plan: list[tuple[str, str]] = []
+    for text, kind in candidates:
+        if text.lower() in seen_q or len(plan) >= _MAX_BROAD_QUERIES:
             continue
-        v = _entry_to_video(e)
-        v.pop("upload_date", None)
-        v["channel"] = e.get("channel") or e.get("uploader")
-        videos.append(v)
+        seen_q.add(text.lower())
+        plan.append((text, kind))
 
-    return {"query": q, "count": len(videos), "videos": videos}
+    if not plan:
+        notes.append(
+            f"Your query returned only {len(relevant)} on-topic results and could "
+            "not be widened: it is too short to shorten mechanically and no "
+            "broader_terms were given. Call again with broader_terms=['...'] - "
+            "2-3 blunt or practitioner phrasings of the same topic."
+        )
+        return {
+            "query": q,
+            "count": len(narrow),
+            "broadened": False,
+            "queries_run": queries_run,
+            "dropped_as_off_topic": 0,
+            "low_confidence": False,
+            "suggested_channels": _suggested_channels(narrow),
+            "note": " ".join(notes),
+            "videos": narrow[:max_results],
+        }
+
+    def _one(item: tuple[str, str]) -> tuple[str, str, Any]:
+        text, kind = item
+        try:
+            return text, kind, _run_search(text, max_results)
+        except Exception as e:  # noqa: BLE001 - a wide search must never fail the call
+            return text, kind, e
+
+    with ThreadPoolExecutor(max_workers=len(plan)) as pool:
+        wide_results = list(pool.map(_one, plan))
+
+    # ---- Phase 3: narrow back in --------------------------------------------
+    by_id: dict[str, dict] = {}
+    for v in narrow:
+        if v.get("video_id"):
+            by_id[v["video_id"]] = v
+
+    kept_wide: list[dict] = []
+    rejected: list[dict] = []
+    failed: list[str] = []
+    for text, kind, outcome in wide_results:
+        if isinstance(outcome, Exception):
+            failed.append(text)
+            queries_run.append({"query": text, "kind": kind, "results": 0})
+            continue
+        queries_run.append({"query": text, "kind": kind, "results": len(outcome)})
+        for v in outcome:
+            vid = v.get("video_id")
+            if not vid or vid in by_id:
+                continue  # your own query already found it; keep that attribution
+            v["relevance"] = round(_relevance(v, groups), 3)
+            v["found_via"] = text
+            by_id[vid] = v
+            # A result from a query the caller never typed has to clear a higher
+            # bar than one from their own words. This is what stops an
+            # intentionally over-broad pass from filling the answer with noise.
+            (kept_wide if v["relevance"] >= _BROAD_KEEP_AT else rejected).append(v)
+
+    merged = narrow + kept_wide
+    low_confidence = False
+    if not merged and rejected:
+        # The caller's query found literally nothing, and nothing from the wide
+        # pass cleared the bar either. Returning an empty list here would be the
+        # exact failure this feature exists to prevent, so hand back the closest
+        # wide hits and label them plainly so the caller knows to distrust them.
+        merged = sorted(rejected, key=lambda v: v["relevance"], reverse=True)[:5]
+        promoted = {v["video_id"] for v in merged}
+        rejected = [v for v in rejected if v["video_id"] not in promoted]
+        low_confidence = True
+
+    # Stable sort: equal relevance keeps YouTube's own ordering, and keeps
+    # results from the caller's own query ahead of wide-pass results.
+    merged.sort(key=lambda v: v["relevance"], reverse=True)
+    videos = merged[:max_results]
+
+    notes.append(
+        f"Your query returned {len(narrow)} results ({len(relevant)} on-topic), "
+        f"which is thin, so {len(plan)} wider search"
+        f"{'es were' if len(plan) != 1 else ' was'} run: "
+        + "; ".join(f"'{t}' ({k})" for t, k in plan)
+        + f". Kept {len(kept_wide)} extra result{'' if len(kept_wide) == 1 else 's'}, "
+        f"dropped {len(rejected)} as off-topic."
+    )
+    if not terms:
+        notes.append(
+            "No broader_terms were given, so only mechanical shortening of your "
+            "own words was possible - no synonyms or adjacent tool names were "
+            "tried, because this tool cannot invent them. If these results are "
+            "still thin, call again with broader_terms=['...'] naming the same "
+            "topic 2-3 different ways."
+        )
+    if low_confidence:
+        notes.append(
+            "LOW CONFIDENCE: nothing matched the topic well. These are the "
+            "closest wide-pass hits, returned rather than nothing at all - "
+            "verify before trusting them."
+        )
+    if failed:
+        notes.append(f"Wider search(es) that failed and were skipped: {', '.join(failed)}.")
+
+    return {
+        "query": q,
+        "count": len(videos),
+        "broadened": True,
+        "queries_run": queries_run,
+        "dropped_as_off_topic": len(rejected),
+        "low_confidence": low_confidence,
+        "suggested_channels": _suggested_channels(videos),
+        "note": " ".join(notes),
+        "videos": videos,
+    }
 
 
 @mcp.tool(

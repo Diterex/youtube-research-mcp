@@ -105,11 +105,28 @@ cheap.
 Returns a text summary followed by one image per timestamp. Frames that fail are noted
 in the summary rather than failing the whole call.
 
-### `search_youtube(query, max_results=20)`
+### `search_youtube(query, max_results=20, broader_terms=None, auto_broaden=True)`
 
 Keyword search, for when you do not know the channel or video yet. Returns the same
-video fields minus the upload date. Use it to find candidates, then feed a result's
-channel or URL to one of the other two tools.
+video fields minus the upload date, plus `relevance` (0.0-1.0) and `found_via`. Use it
+to find candidates, then feed a result's channel or URL to one of the other two tools.
+
+Widens itself automatically when a narrow query comes back empty *or* comes back with
+results that don't look on-topic — no need to remember to retry with a blunter query by
+hand. It runs your query as written, and if that's thin it also tries mechanical
+shortenings of your own words (dropping academic register terms like "optimization",
+trying the head and the lead of the phrase) plus any `broader_terms` you pass, then
+re-ranks everything by topic-word overlap so on-topic results surface and noise gets
+dropped again.
+
+**Always pass `broader_terms`** when the topic matters — 2-3 alternate phrasings
+(practitioner slang, the blunt everyday name, adjacent tool/software names), e.g.
+`broader_terms=["clay 3d printing", "paste extruder"]`. This function is plain Python
+with no model in it, so it cannot invent a synonym or know that two phrasings name the
+same subject — only the calling session can do that. Without `broader_terms`, only
+mechanical shortening is possible, which is real but weaker.
+
+Set `auto_broaden=False` to get the exact old behavior: your query, nothing else.
 
 ## Install and register
 

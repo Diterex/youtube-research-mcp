@@ -123,8 +123,59 @@ def test_frames(video_id):
 def test_search():
     r = server.search_youtube("FreeCAD assembly workbench tutorial", max_results=3)
     assert r["count"] >= 1
+    for field in ("broadened", "queries_run", "note", "low_confidence"):
+        assert field in r, f"missing {field}"
     for v in r["videos"]:
-        print(f"      {v['duration']:>8}  {v['channel']}  {v['title'][:60]}")
+        assert "relevance" in v and "found_via" in v, v
+        print(f"      {v['relevance']:.2f}  {v['duration']:>8}  {v['channel']}  {v['title'][:52]}")
+    return r
+
+
+def test_search_broadening_live():
+    """The real thing this feature was built for, against live YouTube: an
+    academically-phrased query that practitioners never use, plus the blunt
+    phrasings a calling LLM would supply. Offline determinism for the decision
+    logic lives in test_search_broadening.py; this one only proves the wiring
+    works end to end against YouTube's actual ranking.
+
+    Deliberately tolerant: YouTube's index changes, so this asserts that the
+    call succeeds, reports honestly, and does not come back empty - not that a
+    specific video is found.
+    """
+    q = "additive manufacturing parameter optimisation for viscoelastic ceramic feedstock"
+    r = server.search_youtube(
+        q,
+        max_results=8,
+        broader_terms=["clay 3d printing", "ceramic paste extruder"],
+    )
+    print(f"      narrow pass: {r['queries_run'][0]['results']} results, broadened={r['broadened']}")
+    for step in r["queries_run"][1:]:
+        print(f"      + [{step['kind']}] '{step['query'][:52]}' -> {step['results']}")
+    assert r["count"] > 0, f"came back empty even after broadening. note: {r['note']}"
+    for v in r["videos"][:5]:
+        print(f"      {v['relevance']:.2f}  via {str(v['found_via'])[:24]:<24}  {v['title'][:46]}")
+    if r["broadened"]:
+        assert r["queries_run"][0]["kind"] == "narrow"
+        assert len(r["queries_run"]) > 1, "broadened=True but only one query ran"
+        print(f"      dropped {r['dropped_as_off_topic']} as off-topic; "
+              f"low_confidence={r['low_confidence']}")
+        if r["suggested_channels"]:
+            print(f"      suggested channels: "
+                  f"{', '.join(c['channel'] for c in r['suggested_channels'])}")
+    else:
+        print("      narrow pass was already healthy - no widening needed (valid outcome)")
+    return r
+
+
+def test_search_exact_mode_makes_no_extra_requests():
+    """auto_broaden=False has to behave exactly as the tool did before this
+    feature - one query, no widening, whatever YouTube says.
+    """
+    r = server.search_youtube("viscoelastic feedstock rheology characterisation",
+                              max_results=5, auto_broaden=False)
+    assert r["broadened"] is False
+    assert len(r["queries_run"]) == 1, r["queries_run"]
+    print(f"      {r['count']} results, single query, note: {r['note'][:70]}")
     return r
 
 
@@ -161,6 +212,8 @@ if __name__ == "__main__":
         check(f"get_video_transcript {first}", lambda: test_transcript(first))
         check(f"get_video_frames {first}", lambda: test_frames(first))
     check("search_youtube", test_search)
+    check("search_youtube broadening (live)", test_search_broadening_live)
+    check("search_youtube auto_broaden=False", test_search_exact_mode_makes_no_extra_requests)
     check("live stream guard", test_live_stream_guard)
 
     print()
